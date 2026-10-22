@@ -1,0 +1,12 @@
+[Unit]
+Description=Seal the xOS live session account
+Before=xos-kiosk.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xos-seal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+[Unit]
+Description=xOS kiosk shell (Xorg + Openbox + Tkinter)
+After=systemd-user-sessions.service dbus.service ollama.service xos-seal.service
+Wants=ollama.service xos-seal.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=xos
+Group=xos
+SupplementaryGroups=video audio input render
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=no
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+
+Environment=HOME=/home/xos
+Environment=USER=xos
+Environment=LOGNAME=xos
+Environment=XDG_SEAT=seat0
+Environment=XDG_VTNR=1
+Environment=XDG_SESSION_TYPE=x11
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/xos/.Xauthority
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=-/etc/xos/xos-shell.env
+WorkingDirectory=/home/xos
+
+ExecStart=/usr/bin/startx -- :0 vt1 -keeptty -nolisten tcp
+Restart=always
+RestartSec=3
+TimeoutStopSec=8
+
+[Install]
+WantedBy=multi-user.target
