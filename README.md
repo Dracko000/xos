@@ -337,6 +337,38 @@ Disable Secure Boot in the VM. The GRUB build in this image is unsigned. If UEFI
 6. No network connection; Ollama communicates only on loopback.
 7. Reboot resets the machine back to clean state (RAM overlay).
 
+### QEMU Validation (23 Oct 2026)
+
+The generated `dist/xos-alpha.iso` was booted from the ISO in both firmware
+modes under QEMU TCG:
+
+| Mode | Firmware | Result |
+|---|---|---|
+| BIOS | i440fx, 2 GB RAM, 2 vCPU | GRUB -> casper -> xOS kiosk |
+| UEFI | q35 + OVMF, Secure Boot off, 2 GB RAM, 2 vCPU | GRUB -> casper -> xOS kiosk |
+
+SHA-256 of the validated image:
+
+```text
+fc66ff1408a993dda7db94d25ea3abb68125894e772f0a0580cb62a10403c425  xos-alpha.iso
+```
+
+| English default (BIOS) | Bahasa Indonesia (`/language id`) |
+|---|---|
+| ![English default](docs/screenshots/xos-bios-en.png) | ![Bahasa Indonesia](docs/screenshots/xos-bios-id.png) |
+
+| Stop with `Esc` | English default (UEFI) |
+|---|---|
+| ![Stopped](docs/screenshots/xos-bios-stop.png) | ![UEFI](docs/screenshots/xos-uefi-en.png) |
+
+The stop path was verified with a live request: status changed to
+`dihentikan` and input focus returned immediately. Full token generation was
+not validated inside the 2 GB TCG guest because `phi3:mini` needs roughly
+2.2 GB just for weights. Use the 8 GB VirtualBox configuration for inference
+testing. Under QEMU TCG the first Xorg launch can also fail while the
+emulated VGA device is still initializing; `xos-kiosk.service` restarts and
+the kiosk appeared on the third attempt.
+
 ### Debugging
 
 ```text
