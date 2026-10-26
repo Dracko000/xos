@@ -1,6 +1,6 @@
 # xOS Alpha
 
-> **Powered by [AIMB-X Labs](https://github.com/AIMB-X-Labs)**
+> **Powered by [AIMB-X Labs](https://aimb-x.xyz)**
 
 Prototype cognitive operating system: minimal Ubuntu, X11 + Openbox kiosk,
 fullscreen Tkinter shell, and Ollama with models embedded directly inside
@@ -24,6 +24,13 @@ Ubuntu 24.04 VPS
 
 > **Important:** **xOS** is the product/prototype name. This system does not claim
 > to be actual AGI. What runs is an offline, local language model.
+
+## Live site
+
+[![AIMB-X website](docs/screenshots/aimb-x-site.png)](https://aimb-x.xyz)
+
+The public site at [aimb-x.xyz](https://aimb-x.xyz) is built with Next.js,
+Tailwind CSS, and Remotion.
 
 ---
 
