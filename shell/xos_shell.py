@@ -17,7 +17,7 @@ Environment:
   XOS_NUM_CTX          default: 4096
   XOS_NUM_PREDICT      default: 768
   XOS_TEMPERATURE      default: 0.4
-  XOS_LANGUAGE         UI language: en (default) or id
+  XOS_LANGUAGE         UI language: en (default)
   XOS_WINDOWED=1       run in a 1200x760 window (for development)
   XOS_ALLOW_QUIT=1     enable Ctrl+Shift+Q
   XOS_SYSTEM_PROMPT_FILE
@@ -77,7 +77,6 @@ give a proportionate warning and recommend human verification.
 # English keys and translate the values. Missing keys fall back to English.
 SUPPORTED_LANGUAGES: dict[str, str] = {
     "en": "English",
-    "id": "Bahasa Indonesia",
 }
 
 STRINGS: dict[str, dict[str, str]] = {
@@ -110,7 +109,7 @@ STRINGS: dict[str, dict[str, str]] = {
             "/model switch <name> switch active model\n"
             "/model rm <name>     delete an installed model\n"
             "/model pull <name>   pull a new model from registry\n"
-            "/language [code]     show or change UI language (/language id)\n"
+            "/language [code]     show or change UI language \n"
             "/help                show this help\n"
         ),
         "model_help": (
@@ -160,85 +159,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "no_response": "(no response)",
         "stopped_note": "[stopped]",
     },
-    "id": {
-        "connecting": "menghubungkan",
-        "ready": "siap",
-        "ready_model": "siap · {model}",
-        "offline": "ollama offline",
-        "model_missing": "model belum dipasang",
-        "generating": "menghasilkan...",
-        "stopping": "menghentikan...",
-        "stopped": "dihentikan",
-        "error_status": "error · lihat pesan",
-        "send": "Kirim",
-        "stop": "Stop",
-        "footer_hint": "Enter kirim  ·  /clear reset",
-        "quit_hint": "  ·  Ctrl+Shift+Q keluar",
-        "offline_badge": "LOKAL  ·  OFFLINE",
-        "welcome_kicker": "OFFLINE COGNITIVE SHELL",
-        "welcome_title": "Apa yang ingin Anda pikirkan?",
-        "welcome_sub": "Ketik instruksi di bawah. Model berjalan lokal di mesin ini.",
-        "label_you": "ANDA",
-        "label_assistant": "xOS",
-        "label_nalar": "xOS",
-        "label_system": "SISTEM",
-        "help": (
-            "/clear               mulai percakapan baru\n"
-            "/models              tampilkan semua model lokal yang terpasang\n"
-            "/model               tampilkan info model aktif\n"
-            "/model switch <nama> ganti model yang aktif\n"
-            "/model rm <nama>     hapus model dari penyimpanan\n"
-            "/model pull <nama>   unduh model baru dari registry\n"
-            "/language [kode]     tampilkan atau ganti bahasa UI (/language en)\n"
-            "/help                tampilkan bantuan ini\n"
-        ),
-        "model_help": (
-            "Perintah model:\n"
-            "  /models              daftar model terpasang\n"
-            "  /model switch <nama> ganti model aktif\n"
-            "  /model rm <nama>     hapus model\n"
-            "  /model pull <nama>   unduh model baru\n"
-        ),
-        "models_title": "Model Terpasang ({count}):\n",
-        "models_empty": "Belum ada model yang terpasang di Ollama.\n",
-        "models_hint": "Gunakan '/model switch <nama>' untuk berganti, atau '/model rm <nama>' untuk menghapus.\n",
-        "model_active_badge": "[AKTIF]",
-        "model_switched": "Model aktif diubah menjadi '{model}'.\n",
-        "model_not_found": "Model '{model}' belum terpasang.\nModel terpasang: {available}\n",
-        "model_deleted": "Model '{model}' berhasil dihapus.\n",
-        "model_delete_fail": "Gagal menghapus model '{model}': {detail}\n",
-        "model_pull_start": "Mulai mengunduh model '{model}'...\n",
-        "model_pull_done": "Model '{model}' berhasil diunduh!\n",
-        "model_pull_fail": "Gagal mengunduh model '{model}': {detail}\n",
-        "model_rm_usage": "Gunakan: /model rm <nama_model>\n",
-        "model_switch_usage": "Gunakan: /model switch <nama_model>\n",
-        "model_pull_usage": "Gunakan: /model pull <nama_model>\n",
-        "model_info": "Model: {model}\nEndpoint: {url}\nBahasa: {language} ({code})\n",
-        "unknown_command": "Perintah tidak dikenal: {name}\nCoba /help\n",
-        "language_current": (
-            "Bahasa: {language} ({code})\n"
-            "Tersedia: {available}\n"
-            "Gunakan: /language <kode>\n"
-        ),
-        "language_changed": "Bahasa diubah ke {language} ({code}).\n",
-        "language_invalid": "Bahasa tidak didukung: {code}\nTersedia: {available}\n",
-        "error_no_model": (
-            "Model '{model}' tidak ditemukan di Ollama.\n"
-            "Jalankan: ollama pull {model}"
-        ),
-        "error_http": "Ollama HTTP {code}: {detail}",
-        "error_connect": (
-            "Tidak dapat terhubung ke Ollama di {url}.\n"
-            "Periksa: systemctl status ollama\nDetail: {reason}"
-        ),
-        "error_timeout": (
-            "Ollama tidak merespons dalam batas waktu.\n"
-            "Model mungkin sedang dimuat atau RAM VM terlalu kecil."
-        ),
-        "error_generic": "Terjadi kesalahan: {detail}",
-        "no_response": "(tidak ada respons)",
-        "stopped_note": "[dihentikan]",
-    },
+    
 }
 
 
