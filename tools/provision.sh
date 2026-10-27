@@ -37,7 +37,7 @@ console-setup console-setup/charmap47 select UTF-8
 locales locales/default_environment_locale select en_US.UTF-8
 EOF
 
-log "Memasang paket sistem, Xorg, Openbox, Tk, dan casper..."
+log "Installing system packages, Xorg, Openbox, Tk, and casper..."
 apt-get install -y --no-install-recommends \
     systemd-sysv dbus dbus-x11 \
     linux-image-generic initramfs-tools casper \
@@ -56,7 +56,7 @@ apt-get install -y --no-install-recommends \
     zstd libgomp1
 
 # ------------------------------------------------------------------ base config
-log "Mengatur hostname, locale, timezone, dan keyboard..."
+log "Configuring hostname, locale, timezone, and keyboard..."
 printf 'xos\n' >/etc/hostname
 cat >/etc/hosts <<'EOF'
 127.0.0.1 localhost
@@ -83,7 +83,7 @@ ln -snf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
 printf '%s\n' "$TZ_NAME" >/etc/timezone
 
 # ------------------------------------------------------------------ kiosk user
-log "Membuat user kiosk '$KIOSK_USER'..."
+log "Creating kiosk user '$KIOSK_USER'..."
 if ! id -u "$KIOSK_USER" >/dev/null 2>&1; then
     useradd --create-home --uid "$KIOSK_UID" --shell /bin/bash \
         --comment "xOS Kiosk" "$KIOSK_USER"
@@ -98,7 +98,7 @@ printf '%s:%s\n' "$KIOSK_USER" "$XOS_PASSWORD" | chpasswd
 install -d -m 0755 -o "$KIOSK_USER" -g "$KIOSK_USER" "/home/$KIOSK_USER"
 
 # ------------------------------------------------------------------ app files
-log "Memasang xOS shell dan konfigurasi..."
+log "Installing xOS shell and configuration..."
 install -d -m 0755 /opt/xos-shell /etc/xos
 install -m 0755 /tmp/xos-config/xos_shell.py /opt/xos-shell/xos_shell.py
 install -m 0644 /tmp/xos-config/system-prompt.txt /etc/xos/system-prompt.txt
@@ -122,7 +122,7 @@ install -d -m 0755 -o "$KIOSK_USER" -g "$KIOSK_USER" \
 chown -R "$KIOSK_USER:$KIOSK_USER" "/home/$KIOSK_USER"
 
 # ------------------------------------------------------------------ services
-log "Memasang unit systemd..."
+log "Installing systemd units..."
 install -m 0644 /tmp/xos-config/casper.conf /etc/casper.conf
 sed -i "s|^export USERNAME=.*|export USERNAME=\"$KIOSK_USER\"|" /etc/casper.conf
 
@@ -148,7 +148,7 @@ ln -sf /lib/systemd/system/multi-user.target /etc/systemd/system/default.target
 rm -f /etc/systemd/system/getty.target.wants/getty@tty1.service
 
 # ------------------------------------------------------------------ ollama
-log "Memasang Ollama..."
+log "Installing Ollama..."
 if ! id -u ollama >/dev/null 2>&1; then
     useradd --system --create-home --home-dir /var/lib/ollama \
         --shell /usr/sbin/nologin ollama
@@ -161,7 +161,7 @@ ollama_archive=/tmp/ollama-linux-amd64.tar.zst
 if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
     https://ollama.com/download/ollama-linux-amd64.tar.zst \
     -o "$ollama_archive"; then
-    warn "arsip .tar.zst gagal diunduh, mencoba .tgz lama..."
+    warn "archive .tar.zst failed to download, trying old .tgz..."
     ollama_archive=/tmp/ollama-linux-amd64.tgz
     curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
         https://ollama.com/download/ollama-linux-amd64.tgz \
@@ -170,7 +170,7 @@ fi
 tar --zstd -xf "$ollama_archive" -C /usr/local 2>/dev/null || \
     tar -xzf "$ollama_archive" -C /usr/local
 rm -f "$ollama_archive"
-[[ -x /usr/local/bin/ollama ]] || { echo "binary Ollama tidak ditemukan" >&2; exit 1; }
+[[ -x /usr/local/bin/ollama ]] || { echo "Ollama binary not found" >&2; exit 1; }
 /usr/local/bin/ollama --version
 
 if [[ "$SKIP_MODEL_PULL" != "1" ]]; then
@@ -195,7 +195,7 @@ for port in [first, *range(11436, 11500)]:
 raise SystemExit("no free loopback port in 11435-11499")
 PY
 )"
-    log "Mengunduh model '$MODEL' ke image (port build $BUILD_OLLAMA_PORT)..."
+    log "Downloading model '$MODEL' to image (build port $BUILD_OLLAMA_PORT)..."
     mkdir -p /var/lib/ollama/.ollama/models
     chown -R ollama:ollama /var/lib/ollama
 
@@ -244,7 +244,7 @@ names = {item.get("name", "") for item in data.get("models", [])}
 if model not in names and not any(
     name.split(":", 1)[0] == model for name in names
 ):
-    print(f"model {model!r} tidak ditemukan; tersedia: {sorted(names)}", file=sys.stderr)
+    print(f"model {model!r} not found; available: {sorted(names)}", file=sys.stderr)
     raise SystemExit(1)
 print(f"model OK: {model}")
 PY
@@ -259,10 +259,10 @@ else
 fi
 
 # ------------------------------------------------------------------ initramfs
-log "Membangun initramfs dengan hook casper..."
+log "Building initramfs with casper hook..."
 update-initramfs -u -k all
 
-log "Membersihkan cache build..."
+log "Cleaning build cache..."
 apt-get clean
 rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
 rm -rf /root/.cache "/home/$KIOSK_USER/.cache"
@@ -271,10 +271,10 @@ rm -rf /tmp/xos-config /tmp/nalar-os-config /tmp/ollama-build.log
 ln -snf /etc/machine-id /var/lib/dbus/machine-id
 : >/etc/resolv.conf
 
-log "Verifikasi cepat..."
+log "Quick verification..."
 python3 -m py_compile /opt/xos-shell/xos_shell.py
 python3 -c 'import tkinter' >/dev/null
 test -x /usr/local/bin/xos-shell
 test -x /usr/local/bin/ollama
 test -f "/home/$KIOSK_USER/.xinitrc"
-log "Provisioning chroot selesai."
+log "Chroot provisioning complete."

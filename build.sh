@@ -71,7 +71,7 @@ usage() {
 }
 
 require_root() {
-    [[ ${EUID} -eq 0 ]] || die "jalankan sebagai root: sudo $0 ${1:-all}"
+    [[ ${EUID} -eq 0 ]] || die "run as root: sudo $0 ${1:-all}"
 }
 
 prompt_credentials() {
@@ -82,14 +82,14 @@ prompt_credentials() {
     if [[ -z "$KIOSK_USER" ]]; then
         if [[ -t 0 ]]; then
             while true; do
-                printf '\033[1;36m[xos]\033[0m Konfigurasi Username kiosk [default: xos]: '
+                printf '\033[1;36m[xos]\033[0m Kiosk Username Configuration [default: xos]: '
                 read -r user_input
                 user_input="${user_input:-xos}"
                 if [[ "$user_input" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
                     KIOSK_USER="$user_input"
                     break
                 fi
-                warn "Username hanya boleh huruf kecil, angka, underscore, atau dash (harus diawali huruf/underscore)."
+                warn "Username must only contain lowercase letters, numbers, underscores, or dashes (must start with a letter or underscore)."
             done
         else
             KIOSK_USER="xos"
@@ -101,46 +101,46 @@ prompt_credentials() {
     if [[ -z "$XOS_PASSWORD" ]]; then
         if [[ -t 0 ]]; then
             while true; do
-                printf '\033[1;36m[xos]\033[0m Masukkan password untuk user (%s): ' "$KIOSK_USER"
+                printf '\033[1;36m[xos]\033[0m Enter password for user (%s): ' "$KIOSK_USER"
                 read -rs pass_input
                 echo
                 if [[ -z "$pass_input" ]]; then
-                    warn "Password tidak boleh kosong."
+                    warn "Password cannot be empty."
                     continue
                 fi
                 if [[ "$pass_input" == *:* ]]; then
-                    warn "Password tidak boleh mengandung karakter ':'."
+                    warn "Password cannot contain ':' character."
                     continue
                 fi
                 if [[ "$pass_input" == *$'\n'* ]]; then
-                    warn "Password tidak boleh mengandung newline."
+                    warn "Password cannot contain newlines."
                     continue
                 fi
-                printf '\033[1;36m[xos]\033[0m Konfirmasi password: '
+                printf '\033[1;36m[xos]\033[0m Confirm password: '
                 read -rs pass_confirm
                 echo
                 if [[ "$pass_input" != "$pass_confirm" ]]; then
-                    warn "Konfirmasi password tidak cocok. Silakan coba lagi."
+                    warn "Confirm password tidak cocok. Silakan coba lagi."
                     continue
                 fi
                 XOS_PASSWORD="$pass_input"
                 break
             done
         else
-            die "XOS_PASSWORD harus diset jika menjalankan dalam mode non-interaktif (contoh: XOS_PASSWORD='...' ./build.sh all)"
+            die "XOS_PASSWORD must be set when running in non-interactive mode (e.g. XOS_PASSWORD='...' ./build.sh all)"
         fi
     fi
 
-    log "Kredensial siap: user='$KIOSK_USER'"
+    log "Credentials ready: user='$KIOSK_USER'"
 }
 
 validate_inputs() {
-    [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]] || die "MODEL mengandung karakter tidak valid"
-    [[ "$TZ_NAME" =~ ^[A-Za-z0-9._+/-]+$ ]] || die "TZ_NAME tidak valid"
-    [[ "$KIOSK_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "KIOSK_USER tidak valid"
-    [[ -n "$XOS_PASSWORD" ]] || die "XOS_PASSWORD tidak boleh kosong"
-    [[ "$XOS_PASSWORD" != *$'\n'* ]] || die "XOS_PASSWORD tidak boleh mengandung newline"
-    [[ "$XOS_PASSWORD" != *:* ]] || die "XOS_PASSWORD tidak boleh mengandung karakter ':'"
+    [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]] || die "MODEL contains invalid characters"
+    [[ "$TZ_NAME" =~ ^[A-Za-z0-9._+/-]+$ ]] || die "Invalid TZ_NAME"
+    [[ "$KIOSK_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid KIOSK_USER"
+    [[ -n "$XOS_PASSWORD" ]] || die "XOS_PASSWORD cannot be empty"
+    [[ "$XOS_PASSWORD" != *$'\n'* ]] || die "XOS_PASSWORD cannot contain newlines"
+    [[ "$XOS_PASSWORD" != *:* ]] || die "XOS_PASSWORD cannot contain ':' character"
 }
 
 cleanup_mounts() {
@@ -186,32 +186,32 @@ check_space() {
     avail_kb="$(df -Pk "$BUILD_DIR" | awk 'NR==2 {print $4}')"
     need_kb=$((NEED_GB * 1024 * 1024))
     if ((avail_kb < need_kb)); then
-        die "ruang disk kurang: butuh ${NEED_GB} GiB, tersedia $((avail_kb / 1024 / 1024)) GiB di $BUILD_DIR"
+        die "insufficient disk space: need ${NEED_GB} GiB, available $((avail_kb / 1024 / 1024)) GiB in $BUILD_DIR"
     fi
 }
 
 stage_host() {
     require_root host
-    log "Memasang dependensi build di VPS..."
+    log "Installing build dependencies on VPS..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends "${HOST_DEPS[@]}"
-    log "Dependensi siap."
+    log "Dependencies ready."
 }
 
 bootstrap_rootfs() {
     if [[ -e "$ROOTFS/etc/debian_version" && "$FORCE_ROOTFS" != "1" ]]; then
-        log "Rootfs sudah ada: $ROOTFS (lewati debootstrap)"
+        log "Rootfs already exists: $ROOTFS (skipping debootstrap)"
         return
     fi
     if [[ "$FORCE_ROOTFS" == "1" ]]; then
-        log "FORCE_ROOTFS=1: menghapus rootfs lama..."
+        log "FORCE_ROOTFS=1: removing old rootfs..."
         cleanup_mounts
         rm -rf "$ROOTFS"
     fi
 
     mkdir -p "$ROOTFS"
-    log "debootstrap $DISTRO ($ARCH) ke $ROOTFS ..."
+    log "debootstrap $DISTRO ($ARCH) to $ROOTFS ..."
     debootstrap \
         --arch="$ARCH" \
         --variant=minbase \
@@ -228,7 +228,7 @@ EOF
 }
 
 provision_rootfs() {
-    log "Menyiapkan mount chroot..."
+    log "Setting up chroot mount..."
     mount_chroot "$ROOTFS"
 
     # Avoid a dangling systemd-resolved symlink inside the build chroot.
@@ -243,7 +243,7 @@ provision_rootfs() {
     install -Dm755 "$PROJECT_DIR/tools/provision.sh" \
         "$ROOTFS/tmp/provision.sh"
 
-    log "Menjalankan provisioning di chroot (paket, Ollama, model, systemd)..."
+    log "Running provisioning in chroot (packages, Ollama, model, systemd)..."
     if ! chroot "$ROOTFS" /usr/bin/env \
         DEBIAN_FRONTEND=noninteractive \
         MODEL="$MODEL" \
@@ -254,12 +254,12 @@ provision_rootfs() {
         KIOSK_UID="$KIOSK_UID" \
         SKIP_MODEL_PULL="$SKIP_MODEL_PULL" \
         /bin/bash /tmp/provision.sh; then
-        die "provisioning gagal. Periksa log di atas."
+        die "provisioning failed. Check logs above."
     fi
 
     rm -rf "$ROOTFS/tmp/xos-config" "$ROOTFS/tmp/provision.sh"
     cleanup_mounts
-    log "Provisioning selesai."
+    log "Provisioning complete."
 }
 
 stage_rootfs() {
@@ -286,7 +286,7 @@ make_boot_images() {
     rm -rf "$work"
     mkdir -p "$work" "$iso_tree/EFI/BOOT"
 
-    log "Membuat GRUB BIOS core..."
+    log "Creating GRUB BIOS core..."
     grub-mkstandalone \
         --format=i386-pc \
         --output="$core_img" \
@@ -300,7 +300,7 @@ make_boot_images() {
 
     cat /usr/lib/grub/i386-pc/cdboot.img "$core_img" >"$bios_img"
 
-    log "Membuat GRUB EFI standalone..."
+    log "Creating GRUB EFI standalone..."
     grub-mkstandalone \
         --format=x86_64-efi \
         --output="$grubx64" \
@@ -321,16 +321,16 @@ make_boot_images() {
 
 pack_iso() {
     require_root iso
-    [[ -e "$ROOTFS/etc/debian_version" ]] || die "rootfs belum ada. Jalankan: sudo $0 rootfs"
+    [[ -e "$ROOTFS/etc/debian_version" ]] || die "rootfs does not exist. Run: sudo $0 rootfs"
     cleanup_mounts
 
     local kver
     kver="$(find "$ROOTFS/lib/modules" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -n 1)"
-    [[ -n "$kver" ]] || die "tidak menemukan kernel di $ROOTFS/lib/modules"
+    [[ -n "$kver" ]] || die "could not find kernel in $ROOTFS/lib/modules"
     [[ -f "$ROOTFS/boot/vmlinuz-$kver" ]] || die "vmlinuz-$kver tidak ditemukan"
     [[ -f "$ROOTFS/boot/initrd.img-$kver" ]] || die "initrd.img-$kver tidak ditemukan"
 
-    log "Menyiapkan ISO tree..."
+    log "Preparing ISO tree..."
     rm -rf "$ISO_TREE"
     mkdir -p "$ISO_TREE/casper" "$ISO_TREE/boot/grub" "$ISO_TREE/.disk"
 
@@ -358,7 +358,7 @@ home/$KIOSK_USER/.cache/*
 home/nalar/.cache/*
 EOF
 
-    log "Membuat squashfs (zstd level $SQUASHFS_LEVEL). Ini bisa lama..."
+    log "Creating squashfs (zstd level ${SQUASHFS_LEVEL}). This may take a while..."
     mksquashfs "$ROOTFS" "$ISO_TREE/casper/filesystem.squashfs" \
         -noappend \
         -comp zstd \
@@ -373,7 +373,7 @@ EOF
 
     make_boot_images "$ISO_TREE"
 
-    log "Membuat ISO hybrid BIOS+UEFI..."
+    log "Creating hybrid BIOS+UEFI ISO..."
     mkdir -p "$DIST_DIR"
     rm -f "$OUT" "$OUT.sha256"
     xorriso -as mkisofs \
@@ -401,19 +401,19 @@ EOF
     # Store a relative filename so the checksum file stays valid after the
     # ISO is copied to another machine.
     ( cd "$DIST_DIR" && sha256sum "$(basename "$OUT")" >"$(basename "$OUT").sha256" )
-    log "ISO selesai: $OUT"
-    log "Ukuran: $(du -h "$OUT" | cut -f1)"
+    log "ISO complete: $OUT"
+    log "Size: $(du -h "$OUT" | cut -f1)"
     log "SHA256: $(cut -d' ' -f1 "$OUT.sha256")"
-    log "Selanjutnya: salin ISO ke host VirtualBox dan boot sebagai CD/DVD."
+    log "Next: copy ISO to VirtualBox host and boot as CD/DVD."
 }
 
 stage_clean() {
     require_root clean
-    log "Membersihkan build tree dan output..."
+    log "Cleaning build tree and output..."
     cleanup_mounts
     rm -rf "$BUILD_DIR"
     rm -f "$OUT" "$OUT.sha256"
-    log "Selesai."
+    log "Done."
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -432,6 +432,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         clean)  stage_clean ;;
         -h|--help|help) usage ;;
-        *) die "perintah tidak dikenal: $1 (gunakan host|rootfs|iso|all|clean)" ;;
+        *) die "unknown command: $1 (use host|rootfs|iso|all|clean)" ;;
     esac
 fi
