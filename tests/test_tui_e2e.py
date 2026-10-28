@@ -14,6 +14,8 @@ import select
 import subprocess
 import time
 import unittest
+import fcntl
+import struct
 
 ANSI_CSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 ANSI_OTHER = re.compile(r"\x1b[@-_]")
@@ -39,6 +41,13 @@ class TuiHarness(unittest.TestCase):
         env.update(self.extra_env)
 
         self.master_fd, slave_fd = pty.openpty()
+
+        # Force window size (80x24) to ensure ncurses can initialize and draw.
+        # TIOCSWINS is the ioctl for setting window size.
+        # The size is a struct winsize { unsigned short ws_row; unsigned short ws_col; ... }
+        size = struct.pack("HHII", 24, 80, 0, 0)
+        fcntl.ioctl(self.master_fd, 0x5414, size) # 0x5414 is TIOCSWINS on most Linux x86_64
+
         self.proc = subprocess.Popen(
             ["python3", "shell/xos_shell.py"],
             stdin=slave_fd,
