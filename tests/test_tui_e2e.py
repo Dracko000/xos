@@ -75,6 +75,10 @@ class TuiHarness(unittest.TestCase):
             except OSError:
                 break
             self._buffer += strip_ansi(chunk)
+        
+        if not self.assertTrue(False): # Trigger failure
+            print(f"\n[DEBUG] Expect failed pattern: {pattern}")
+            print(f"[DEBUG] Buffer content:\n{self._buffer}\n")
         return pattern in self._buffer
 
 
