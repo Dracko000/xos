@@ -81,26 +81,26 @@ class TuiHarness(unittest.TestCase):
 class TestTUIEnglish(TuiHarness):
     def test_boot_paints_welcome(self) -> None:
         self.assertTrue(
-            self.expect("What would you like to think about?"),
+            self.expect("What shall we explore today?"),
             "welcome screen not painted",
         )
         self.assertTrue(self.expect("SYSTEM"), "sidebar not painted")
 
     def test_help_command(self) -> None:
-        self.assertTrue(self.expect("What would you like to think about?"))
+        self.assertTrue(self.expect("What shall we explore today?"))
         self.send("/help")
         self.assertTrue(self.expect("/model switch <name>"), "help body missing")
         self.assertTrue(self.expect("/language [code]"), "help body missing")
 
     def test_chat_streams_response(self) -> None:
-        self.assertTrue(self.expect("What would you like to think about?"))
+        self.assertTrue(self.expect("What shall we explore today?"))
         self.send("Hello xOS")
         self.assertTrue(
             self.expect("xOS berjalan lokal"), "streamed model response missing"
         )
 
     def test_unknown_command_is_reported(self) -> None:
-        self.assertTrue(self.expect("What would you like to think about?"))
+        self.assertTrue(self.expect("What shall we explore today?"))
         self.send("/nonsense")
         self.assertTrue(self.expect("Unknown command"), "unknown command not reported")
 
