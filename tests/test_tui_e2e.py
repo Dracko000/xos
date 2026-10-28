@@ -76,9 +76,10 @@ class TuiHarness(unittest.TestCase):
                 break
             self._buffer += strip_ansi(chunk)
         
-        if not self.assertTrue(False): # Trigger failure
+        if pattern not in self._buffer:
             print(f"\n[DEBUG] Expect failed pattern: {pattern}")
-            print(f"[DEBUG] Buffer content:\n{self._buffer}\n")
+            print(f"[DEBUG] Buffer content (repr):\n{repr(self._buffer)}\n")
+            print(f"[DEBUG] Buffer content (stripped):\n{self._buffer}\n")
         return pattern in self._buffer
 
 
