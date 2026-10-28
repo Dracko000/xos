@@ -855,7 +855,8 @@ class Shell:
         
         # language section
         self._put(5, sx + 1, self.tr("lbl_lang"), self.C_MUTED | curses.A_BOLD)
-        lang_info = f"{self.language_name} ({self.language})"
+        lang_name = SUPPORTED_LANGUAGES.get(self.language, "Unknown")
+        lang_info = f"{lang_name} ({self.language})"
         self._put(6, sx + 1, lang_info, self.C_MINT)
         
         # clock section
