@@ -872,9 +872,6 @@ class Shell:
         
         # Final sidebar border
         self._put(18, sx + 1, "─" * (side - 3), self.C_MUTED)
-        ]
-        for i, (key, what) in enumerate(keys):
-            self._put(row + 2 + i, sx + 1, f"{key:<6}{what}"[: side - 3], self.C_MUTED)
 
         # separator + input
         self._put(h - 4, 0, "─" * w, self.C_MUTED)
