@@ -869,15 +869,9 @@ class Shell:
         for i, line in enumerate(help_text.split("\n")):
             if i < 8: # cap to avoid overflow
                 self._put(10 + i, sx + 1, line, self.C_MUTED)
-            row += 3
-
-        self._put(row, sx + 1, "─" * (side - 3), self.C_MUTED)
-        self._put(row + 1, sx + 1, self.tr("lbl_keys"), self.C_MINT | curses.A_BOLD)
-        keys = [
-            ("Enter", self.tr("key_send")),
-            ("Esc", self.tr("key_stop")),
-            ("^L", self.tr("key_clear")),
-            ("/help", self.tr("key_commands")),
+        
+        # Final sidebar border
+        self._put(18, sx + 1, "─" * (side - 3), self.C_MUTED)
         ]
         for i, (key, what) in enumerate(keys):
             self._put(row + 2 + i, sx + 1, f"{key:<6}{what}"[: side - 3], self.C_MUTED)
