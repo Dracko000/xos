@@ -98,7 +98,7 @@ class TestTUIEnglish(TuiHarness):
             self.expect("What shall we explore today?"),
             "welcome screen not painted",
         )
-        self.assertTrue(self.expect("SYSTEM"), "sidebar not painted")
+        self.assertTrue(self.expect("STATE"), "sidebar not painted")
 
     def test_help_command(self) -> None:
         self.assertTrue(self.expect("What shall we explore today?"))
@@ -123,14 +123,14 @@ class TestTUIIndonesian(TuiHarness):
     extra_env = {"XOS_LANGUAGE": "id"}
 
     def test_boot_is_indonesian(self) -> None:
-        # First paint emits the whole sidebar, so "SISTEM" is a reliable signal.
-        self.assertTrue(self.expect("SISTEM"), "sidebar not localised to Indonesian")
+        # First paint emits the whole sidebar, so "STATUS" is a reliable signal.
+        self.assertTrue(self.expect("STATUS"), "sidebar not localised to Indonesian")
         self.assertTrue(
-            self.expect("Apa yang ingin Anda pikirkan?"), "welcome not localised"
+            self.expect("Apa yang ingin Anda jelajahi hari ini?"), "welcome not localised"
         )
 
     def test_language_switch_notice(self) -> None:
-        self.assertTrue(self.expect("SISTEM"))
+        self.assertTrue(self.expect("STATUS"))
         self.send("/language en")
         self.assertTrue(
             self.expect("Language set to English"), "switch notice not shown"
