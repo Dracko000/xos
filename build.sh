@@ -66,6 +66,42 @@ log()  { printf '\033[1;36m[xos]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[xos] WARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[xos] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
+validate_path() {
+    local path="$1"
+    local context="$2"
+
+    if [[ -z "$path" ]]; then
+        die "Path for $context is empty. This is a critical security risk."
+    fi
+
+    # Resolve to absolute canonical path
+    local canonical
+    canonical=$(readlink -f "$path" 2>/dev/null || echo "$path")
+
+    # 1. Absolute Root
+    if [[ "$canonical" == "/" ]]; then
+        die "Path for $context resolves to root (/). Operation rejected."
+    fi
+
+    # 2. Critical System Directories
+    local critical_dirs=("/etc" "/bin" "/sbin" "/usr" "/var" "/boot" "/dev" "/proc" "/sys" "/run")
+    for dir in "${critical_dirs[@]}"; do
+        if [[ "$canonical" == "$dir" ]] || [[ "$canonical" == "$dir/"* ]]; then
+            die "Path for $context resolves to critical system directory $dir. Operation rejected."
+        fi
+    done
+
+    # 3. Home Directory
+    if [[ -n "$HOME" ]] && [[ "$canonical" == "$HOME" ]] || [[ "$canonical" == "$HOME/"* ]]; then
+        die "Path for $context resolves to home directory. Operation rejected."
+    fi
+
+    # 4. Too short paths (e.g., /a, /b)
+    if [[ ${#canonical} -lt 4 ]] && [[ "$canonical" == /* ]]; then
+        die "Path for $context ('$canonical') is too generic. Operation rejected."
+    fi
+}
+
 usage() {
     sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
 }
@@ -207,6 +243,7 @@ bootstrap_rootfs() {
     if [[ "$FORCE_ROOTFS" == "1" ]]; then
         log "FORCE_ROOTFS=1: removing old rootfs..."
         cleanup_mounts
+        validate_path "$ROOTFS" "ROOTFS removal"
         rm -rf "$ROOTFS"
     fi
 
@@ -235,6 +272,7 @@ provision_rootfs() {
     rm -f "$ROOTFS/etc/resolv.conf"
     cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
 
+    validate_path "$ROOTFS/tmp/xos-config" "xos-config cleanup"
     rm -rf "$ROOTFS/tmp/xos-config"
     mkdir -p "$ROOTFS/tmp/xos-config"
     cp -a "$PROJECT_DIR/config/." "$ROOTFS/tmp/xos-config/"
@@ -283,6 +321,7 @@ make_boot_images() {
     bios_modules="linux normal iso9660 biosdisk search search_fs_file all_video video gfxterm font test true part_msdos part_gpt boot"
     efi_modules="linux normal iso9660 search search_fs_file all_video video gfxterm font test true part_msdos part_gpt boot"
 
+    validate_path "$work" "boot workdir cleanup"
     rm -rf "$work"
     mkdir -p "$work" "$iso_tree/EFI/BOOT"
 
@@ -331,6 +370,7 @@ pack_iso() {
     [[ -f "$ROOTFS/boot/initrd.img-$kver" ]] || die "initrd.img-$kver tidak ditemukan"
 
     log "Preparing ISO tree..."
+    validate_path "$ISO_TREE" "ISO tree cleanup"
     rm -rf "$ISO_TREE"
     mkdir -p "$ISO_TREE/casper" "$ISO_TREE/boot/grub" "$ISO_TREE/.disk"
 
@@ -411,6 +451,7 @@ stage_clean() {
     require_root clean
     log "Cleaning build tree and output..."
     cleanup_mounts
+    validate_path "$BUILD_DIR" "build directory cleanup"
     rm -rf "$BUILD_DIR"
     rm -f "$OUT" "$OUT.sha256"
     log "Done."

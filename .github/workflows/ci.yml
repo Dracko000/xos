@@ -1,0 +1,35 @@
+name: CI
+
+# Lightweight checks only. Building the ISO (debootstrap + ~5 GB of packages
+# and model weights) is intentionally NOT part of this workflow; see
+# docs/BUILD.md for the manual ISO build and boot-test procedure.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint, unit and TUI tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -n 1
+          python3 --version
+
+      - name: Run CI checks
+        run: ./tools/ci_check.sh

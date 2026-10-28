@@ -3,13 +3,14 @@
 xOS Shell
 =========
 
-A dependency-free Tkinter kiosk frontend for a local Ollama server.
+A dependency-free terminal (curses) cognitive shell for a local Ollama server.
 
 Design constraints:
-  * Python 3 + Tk only (no pip packages at runtime).
-  * Never blocks the Tk main loop; HTTP streaming happens on a worker thread.
+  * Python 3 standard library only (no pip packages at runtime).
+  * Never blocks the UI thread: every network call runs on a worker thread and
+    reports back through a queue.
   * Talks to Ollama over 127.0.0.1 only.
-  * Fullscreen by default, with a windowed escape hatch for development.
+  * Runs on a plain Linux console (no Xorg, no display server required).
 
 Environment:
   XOS_OLLAMA_URL       default: http://127.0.0.1:11434
@@ -17,29 +18,30 @@ Environment:
   XOS_NUM_CTX          default: 4096
   XOS_NUM_PREDICT      default: 768
   XOS_TEMPERATURE      default: 0.4
-  XOS_LANGUAGE         UI language: en (default)
-  XOS_WINDOWED=1       run in a 1200x760 window (for development)
-  XOS_ALLOW_QUIT=1     enable Ctrl+Shift+Q
+  XOS_LANGUAGE         UI language: en (default) or id
+  XOS_ALLOW_QUIT=1     enable Ctrl+C / /quit
   XOS_SYSTEM_PROMPT_FILE
                        default: /etc/xos/system-prompt.txt
 """
 
 from __future__ import annotations
 
+import curses
+import datetime
 import json
 import logging
 import os
 import queue
 import socket
+import sys
 import threading
-import datetime
-import tkinter as tk
-import tkinter.font as tkfont
+import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
 
 
+# --------------------------------------------------------------------- config
 def get_env(primary: str, secondary: str | None = None, default: str = "") -> str:
     if primary in os.environ:
         return os.environ[primary]
@@ -48,10 +50,28 @@ def get_env(primary: str, secondary: str | None = None, default: str = "") -> st
     return default
 
 
+def is_loopback(url: str) -> bool:
+    """Verify if the URL points to a local loopback address."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if host is None:
+            # Handle port-only URLs (e.g. http://:11434) or raw loopback strings
+            if parsed.netloc.startswith(":") or not parsed.netloc:
+                if not parsed.netloc and not url.startswith(("127.0.0.1", "localhost", "::1")):
+                    return False
+                return True
+            return False
+        return host in ("localhost", "127.0.0.1", "::1")
+    except Exception:
+        return False
+
+
 APP_NAME = "xOS"
 OLLAMA_URL = get_env("XOS_OLLAMA_URL", "NALAR_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+STRICT_LOCAL = get_env("XOS_STRICT_LOCAL", None, "1") == "1"
 MODEL = get_env("XOS_MODEL", "NALAR_MODEL", "phi3:mini")
-WINDOWED = get_env("XOS_WINDOWED", "NALAR_WINDOWED", "0") == "1"
 ALLOW_QUIT = get_env("XOS_ALLOW_QUIT", "NALAR_ALLOW_QUIT", "0") == "1"
 SYSTEM_PROMPT_FILE = Path(
     get_env("XOS_SYSTEM_PROMPT_FILE", "NALAR_SYSTEM_PROMPT_FILE", "/etc/xos/system-prompt.txt")
@@ -73,179 +93,143 @@ data, ask for it.
 give a proportionate warning and recommend human verification.
 """
 
-# UI and assistant language support. English is the default. The dictionary is
-# intentionally flat and easy to extend: add a locale code here, then copy the
-# English keys and translate the values. Missing keys fall back to English.
-SUPPORTED_LANGUAGES: dict[str, str] = {
-    "en": "English",
-    "id": "Bahasa Indonesia",
-}
+SUPPORTED_LANGUAGES: dict[str, str] = {"en": "English", "id": "Bahasa Indonesia"}
 
 STRINGS: dict[str, dict[str, str]] = {
     "en": {
         "connecting": "connecting",
         "ready": "ready",
-        "ready_model": "ready · {model}",
         "offline": "ollama offline",
-        "model_missing": "model not installed",
-        "generating": "generating...",
-        "stopping": "stopping...",
+        "model_missing": "model missing",
+        "generating": "generating",
         "stopped": "stopped",
-        "error_status": "error · see message",
-        "send": "Send",
-        "stop": "Stop",
-        "footer_hint": "Enter to send  ·  /clear reset",
-        "quit_hint": "  ·  Ctrl+Shift+Q quit",
-        "offline_badge": "LOCAL  ·  OFFLINE",
+        "error": "error",
+        "brand": "OFFLINE COGNITIVE SHELL",
+        "alpha": "ALPHA 0.1",
+        "sidebar_title": "SYSTEM",
+        "lbl_time": "TIME",
+        "lbl_model": "MODEL",
+        "lbl_lang": "LANG",
+        "lbl_state": "STATE",
+        "lbl_keys": "KEYS",
+        "hint": "Enter send  ·  Esc stop  ·  ^L clear  ·  /help",
+        "input_prompt": "› ",
+        "key_send": "send",
+        "key_stop": "stop",
+        "key_clear": "clear",
+        "key_commands": "commands",
+        "you": "YOU",
+        "assistant": "xOS",
+        "system": "SYSTEM",
         "welcome_kicker": "OFFLINE COGNITIVE SHELL",
-        "welcome_title": "What would you like to think about?",
-        "welcome_sub": "Type an instruction below. The model runs locally on this machine.",
-        "label_you": "YOU",
-        "label_assistant": "xOS",
-        "label_nalar": "xOS",
-        "label_system": "SYSTEM",
-        "help": (
-            "/clear               start a new conversation\n"
-            "/models              list all installed local models\n"
-            "/model               show active model info\n"
-            "/model switch <name> switch active model\n"
-            "/model rm <name>     delete an installed model\n"
-            "/model pull <name>   pull a new model from registry\n"
-            "/language [code]     show or change UI language \n"
-            "/help                show this help\n"
-        ),
-        "model_help": (
-            "Model commands:\n"
-            "  /models              list installed models\n"
-            "  /model switch <name> switch active model\n"
-            "  /model rm <name>     delete a model\n"
-            "  /model pull <name>   pull a new model\n"
-        ),
-        "models_title": "Installed Models ({count}):\n",
-        "models_empty": "No models currently installed in Ollama.\n",
-        "models_hint": "Use '/model switch <name>' to switch, or '/model rm <name>' to delete.\n",
-        "model_active_badge": "[ACTIVE]",
-        "model_switched": "Active model switched to '{model}'.\n",
-        "model_not_found": "Model '{model}' is not installed.\nInstalled: {available}\n",
-        "model_deleted": "Model '{model}' successfully deleted.\n",
-        "model_delete_fail": "Failed to delete model '{model}': {detail}\n",
-        "model_pull_start": "Pulling model '{model}'...\n",
-        "model_pull_done": "Model '{model}' successfully pulled!\n",
-        "model_pull_fail": "Failed to pull model '{model}': {detail}\n",
-        "model_rm_usage": "Usage: /model rm <model_name>\n",
-        "model_switch_usage": "Usage: /model switch <model_name>\n",
-        "model_pull_usage": "Usage: /model pull <model_name>\n",
-        "model_info": "Model: {model}\nEndpoint: {url}\nLanguage: {language} ({code})\n",
-        "unknown_command": "Unknown command: {name}\nTry /help\n",
-        "language_current": (
-            "Language: {language} ({code})\n"
-            "Available: {available}\n"
-            "Usage: /language <code>\n"
-        ),
-        "language_changed": "Language set to {language} ({code}).\n",
-        "language_invalid": "Unsupported language: {code}\nAvailable: {available}\n",
-        "error_no_model": (
-            "Model '{model}' is not installed in Ollama.\n"
-            "Run: ollama pull {model}"
-        ),
-        "error_http": "Ollama HTTP {code}: {detail}",
-        "error_connect": (
-            "Cannot reach Ollama at {url}.\n"
-            "Check: systemctl status ollama\nDetail: {reason}"
-        ),
-        "error_timeout": (
-            "Ollama did not respond in time.\n"
-            "The model may still be loading, or the VM has too little RAM."
-        ),
-        "error_generic": "Something went wrong: {detail}",
+        "welcome_title": "What shall we explore today?",
+        "welcome_sub": "Think aloud. The model runs entirely on this machine.",
         "no_response": "(no response)",
         "stopped_note": "[stopped]",
+        "help": (
+            "/clear                reset conversation\n"
+            "/models               list installed models\n"
+            "/model                show active model info\n"
+            "/model switch <name>  switch active model\n"
+            "/model rm <name>      delete an installed model\n"
+            "/model pull <name>    pull a new model\n"
+            "/language [code]      change UI language\n"
+            "/help                 show this help\n"
+        ),
+        "models_title": "Installed models ({count}):",
+        "models_empty": "No models installed in Ollama.",
+        "models_hint": "Use /model switch <name> to switch, /model rm <name> to delete.",
+        "model_active": "[ACTIVE]",
+        "model_switched": "Active model switched to '{model}'.",
+        "model_not_found": "Model '{model}' is not installed. Installed: {available}",
+        "model_deleted": "Model '{model}' deleted.",
+        "model_delete_fail": "Failed to delete '{model}': {detail}",
+        "model_pull_start": "Pulling '{model}'...",
+        "model_pull_done": "Model '{model}' pulled.",
+        "model_pull_fail": "Failed to pull '{model}': {detail}",
+        "model_info": "Model: {model}\nEndpoint: {url}\nLanguage: {language} ({code})",
+        "language_current": "Language: {language} ({code}). Available: {available}. Usage: /language <code>",
+        "language_changed": "Language set to {language} ({code}).",
+        "language_invalid": "Unsupported language '{code}'. Available: {available}.",
+        "unknown_command": "Unknown command: {name}. Try /help",
+        "usage_switch": "Usage: /model switch <name>",
+        "usage_rm": "Usage: /model rm <name>",
+        "usage_pull": "Usage: /model pull <name>",
+        "error_no_model": "Model '{model}' is not installed.\nRun: ollama pull {model}",
+        "error_http": "Ollama HTTP {code}: {detail}",
+        "error_connect": "Cannot reach Ollama at {url}.\nCheck: systemctl status ollama\nDetail: {reason}",
+        "error_timeout": "Ollama did not respond in time. The model may still be loading.",
+        "error_generic": "Something went wrong: {detail}",
     },
     "id": {
         "connecting": "menghubungkan",
         "ready": "siap",
-        "ready_model": "siap · {model}",
         "offline": "ollama offline",
         "model_missing": "model belum dipasang",
-        "generating": "menghasilkan...",
-        "stopping": "menghentikan...",
+        "generating": "menghasilkan",
         "stopped": "dihentikan",
-        "error_status": "error · lihat pesan",
-        "send": "Kirim",
-        "stop": "Stop",
-        "footer_hint": "Enter kirim  ·  /clear reset",
-        "quit_hint": "  ·  Ctrl+Shift+Q keluar",
-        "offline_badge": "LOKAL  ·  OFFLINE",
+        "error": "error",
+        "brand": "OFFLINE COGNITIVE SHELL",
+        "alpha": "ALPHA 0.1",
+        "sidebar_title": "SISTEM",
+        "lbl_time": "WAKTU",
+        "lbl_model": "MODEL",
+        "lbl_lang": "BAHASA",
+        "lbl_state": "STATUS",
+        "lbl_keys": "TOMBOL",
+        "hint": "Enter kirim  ·  Esc stop  ·  ^L reset  ·  /help",
+        "input_prompt": "› ",
+        "key_send": "kirim",
+        "key_stop": "stop",
+        "key_clear": "reset",
+        "key_commands": "perintah",
+        "you": "ANDA",
+        "assistant": "xOS",
+        "system": "SISTEM",
         "welcome_kicker": "OFFLINE COGNITIVE SHELL",
-        "welcome_title": "Apa yang ingin Anda pikirkan?",
-        "welcome_sub": "Ketik instruksi di bawah. Model berjalan lokal di mesin ini.",
-        "label_you": "ANDA",
-        "label_assistant": "xOS",
-        "label_nalar": "xOS",
-        "label_system": "SISTEM",
-        "help": (
-            "/clear               mulai percakapan baru\n"
-            "/models              tampilkan semua model lokal yang terpasang\n"
-            "/model               tampilkan info model aktif\n"
-            "/model switch <nama> ganti model yang aktif\n"
-            "/model rm <nama>     hapus model dari penyimpanan\n"
-            "/model pull <nama>   unduh model baru dari registry\n"
-            "/language [kode]     tampilkan atau ganti bahasa UI (/language en)\n"
-            "/help                tampilkan bantuan ini\n"
-        ),
-        "model_help": (
-            "Perintah model:\n"
-            "  /models              daftar model terpasang\n"
-            "  /model switch <nama> ganti model aktif\n"
-            "  /model rm <nama>     hapus model\n"
-            "  /model pull <nama>   unduh model baru\n"
-        ),
-        "models_title": "Model Terpasang ({count}):\n",
-        "models_empty": "Belum ada model yang terpasang di Ollama.\n",
-        "models_hint": "Gunakan '/model switch <nama>' untuk berganti, atau '/model rm <nama>' untuk menghapus.\n",
-        "model_active_badge": "[AKTIF]",
-        "model_switched": "Model aktif diubah menjadi '{model}'.\n",
-        "model_not_found": "Model '{model}' belum terpasang.\nModel terpasang: {available}\n",
-        "model_deleted": "Model '{model}' berhasil dihapus.\n",
-        "model_delete_fail": "Gagal menghapus model '{model}': {detail}\n",
-        "model_pull_start": "Mulai mengunduh model '{model}'...\n",
-        "model_pull_done": "Model '{model}' berhasil diunduh!\n",
-        "model_pull_fail": "Gagal mengunduh model '{model}': {detail}\n",
-        "model_rm_usage": "Gunakan: /model rm <nama_model>\n",
-        "model_switch_usage": "Gunakan: /model switch <nama_model>\n",
-        "model_pull_usage": "Gunakan: /model pull <nama_model>\n",
-        "model_info": "Model: {model}\nEndpoint: {url}\nBahasa: {language} ({code})\n",
-        "unknown_command": "Perintah tidak dikenal: {name}\nCoba /help\n",
-        "language_current": (
-            "Bahasa: {language} ({code})\n"
-            "Tersedia: {available}\n"
-            "Gunakan: /language <kode>\n"
-        ),
-        "language_changed": "Bahasa diubah ke {language} ({code}).\n",
-        "language_invalid": "Bahasa tidak didukung: {code}\nTersedia: {available}\n",
-        "error_no_model": (
-            "Model '{model}' tidak ditemukan di Ollama.\n"
-            "Jalankan: ollama pull {model}"
-        ),
-        "error_http": "Ollama HTTP {code}: {detail}",
-        "error_connect": (
-            "Tidak dapat terhubung ke Ollama di {url}.\n"
-            "Periksa: systemctl status ollama\nDetail: {reason}"
-        ),
-        "error_timeout": (
-            "Ollama tidak merespons dalam batas waktu.\n"
-            "Model mungkin sedang dimuat atau RAM VM terlalu kecil."
-        ),
-        "error_generic": "Terjadi kesalahan: {detail}",
+        "welcome_title": "Apa yang ingin Anda jelajahi hari ini?",
+        "welcome_sub": "Berpikirlah dengan lantang. Model berjalan sepenuhnya di mesin ini.",
         "no_response": "(tidak ada respons)",
         "stopped_note": "[dihentikan]",
+        "help": (
+            "/clear                mulai percakapan baru\n"
+            "/models               daftar model lokal terpasang\n"
+            "/model                info model aktif\n"
+            "/model switch <nama>  ganti model aktif\n"
+            "/model rm <nama>      hapus model terpasang\n"
+            "/model pull <nama>    unduh model baru\n"
+            "/language [kode]      tampilkan atau ganti bahasa\n"
+            "/help                 tampilkan bantuan ini\n"
+        ),
+        "models_title": "Model terpasang ({count}):",
+        "models_empty": "Belum ada model terpasang di Ollama.",
+        "models_hint": "Gunakan /model switch <nama> untuk berganti, /model rm <nama> untuk menghapus.",
+        "model_active": "[AKTIF]",
+        "model_switched": "Model aktif diubah ke '{model}'.",
+        "model_not_found": "Model '{model}' belum terpasang. Terpasang: {available}",
+        "model_deleted": "Model '{model}' dihapus.",
+        "model_delete_fail": "Gagal menghapus '{model}': {detail}",
+        "model_pull_start": "Mengunduh '{model}'...",
+        "model_pull_done": "Model '{model}' selesai diunduh.",
+        "model_pull_fail": "Gagal mengunduh '{model}': {detail}",
+        "model_info": "Model: {model}\nEndpoint: {url}\nBahasa: {language} ({code})",
+        "language_current": "Bahasa: {language} ({code}). Tersedia: {available}. Gunakan: /language <kode>",
+        "language_changed": "Bahasa diubah ke {language} ({code}).",
+        "language_invalid": "Bahasa tidak didukung '{code}'. Tersedia: {available}.",
+        "unknown_command": "Perintah tidak dikenal: {name}. Coba /help",
+        "usage_switch": "Gunakan: /model switch <nama>",
+        "usage_rm": "Gunakan: /model rm <nama>",
+        "usage_pull": "Gunakan: /model pull <nama>",
+        "error_no_model": "Model '{model}' tidak ditemukan.\nJalankan: ollama pull {model}",
+        "error_http": "Ollama HTTP {code}: {detail}",
+        "error_connect": "Tidak dapat terhubung ke Ollama di {url}.\nPeriksa: systemctl status ollama\nDetail: {reason}",
+        "error_timeout": "Ollama tidak merespons dalam batas waktu. Model mungkin sedang dimuat.",
+        "error_generic": "Terjadi kesalahan: {detail}",
     },
-    
 }
 
 
 def normalize_language(value: str) -> str | None:
-    """Return a supported locale code, accepting en-US/en_US variants."""
     code = value.strip().lower().replace("_", "-").split("-", 1)[0]
     return code if code in SUPPORTED_LANGUAGES else None
 
@@ -258,20 +242,20 @@ def load_system_prompt() -> str:
         return DEFAULT_SYSTEM_PROMPT
 
 
-def env_int(primary: str, secondary: str | None, default: int, minimum: int, maximum: int) -> int:
+def env_int(primary: str, secondary: str | None, default: int, lo: int, hi: int) -> int:
     try:
         value = int(get_env(primary, secondary, str(default)))
     except ValueError:
         return default
-    return max(minimum, min(maximum, value))
+    return max(lo, min(hi, value))
 
 
-def env_float(primary: str, secondary: str | None, default: float, minimum: float, maximum: float) -> float:
+def env_float(primary: str, secondary: str | None, default: float, lo: float, hi: float) -> float:
     try:
         value = float(get_env(primary, secondary, str(default)))
     except ValueError:
         return default
-    return max(minimum, min(maximum, value))
+    return max(lo, min(hi, value))
 
 
 SYSTEM_PROMPT = load_system_prompt()
@@ -292,83 +276,90 @@ def format_size(bytes_val: int) -> str:
     return f"{val:.1f} {units[i]}"
 
 
-class XOSShell:
-    # Palette
-    BG = "#080a0d"
-    PANEL = "#0f131a"
-    PANEL_2 = "#141924"
-    BORDER = "#222a38"
-    FG = "#e8ebf1"
-    ASSISTANT = "#cbd2df"
-    MUTED = "#7f899b"
-    ACCENT = "#67e8f9"
-    ACCENT_SOFT = "#164e63"
-    GREEN = "#5eead4"
-    AMBER = "#fbbf24"
-    RED = "#fb7185"
-    ERROR = "#fda4af"
-    BUTTON_TEXT = "#041014"
+# ---------------------------------------------------------------------- shell
+class Shell:
+    SIDEBAR_W = 26
+    TICK_MS = 80          # input poll interval
+    REDRAW_S = 0.12       # minimum time between redraws
 
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title(APP_NAME)
-        self.root.configure(bg=self.BG)
-        self.root.minsize(860, 560)
-        self.root.protocol("WM_DELETE_WINDOW", self._close)
+    def __init__(self, scr: "curses.window", headless: bool = False) -> None:
+        self.scr = scr
+        self.lock = threading.Lock()
+        self.headless = headless
 
-        self.ui_font, self.mono_font = self._pick_fonts()
-        self.scale = self._ui_scale()
-        self.fs = lambda size: max(9, int(round(size * self.scale)))
-
-        requested_language = get_env("XOS_LANGUAGE", "NALAR_LANGUAGE", "en")
-        self.language = normalize_language(requested_language) or "en"
-        if normalize_language(requested_language) is None:
-            logging.warning("Unsupported language=%r; using en", requested_language)
+        self.language = normalize_language(get_env("XOS_LANGUAGE", "NALAR_LANGUAGE", "en")) or "en"
         self.system_prompt_base = SYSTEM_PROMPT
 
-        self.history: list[dict[str, str]] = [
-            {"role": "system", "content": self._system_prompt()}
-        ]
-        self.events: queue.Queue[tuple[str, Any, int]] = queue.Queue()
+        self.language = normalize_language(get_env("XOS_LANGUAGE", "NALAR_LANGUAGE", "en")) or "en"
+        self.system_prompt_base = SYSTEM_PROMPT
+
+        self.messages: list[dict[str, Any]] = []
+        self.history: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt()}]
+        self.input = ""
+        self.scroll = 0
         self.busy = False
+        self.generation = 0
         self.stop_event = threading.Event()
         self.response: Any | None = None
-        self.generation = 0
-        self.health_busy = False
-        self.health_checked = False
+        self.events: queue.Queue[tuple[str, Any, int]] = queue.Queue()
+
         self.server_ok = False
         self.model_ok = False
+        self.health_checked = False
+        self.health_busy = False
         self.active_model = MODEL
-        self.installed_model_names: set[str] = set()
-        self.welcome_visible = True
-        self.status_var = tk.StringVar(value=self.tr("connecting"))
+        self.installed: set[str] = set()
 
-        self._build_ui()
-        self._bind_keys()
+        self.clock = ""
+        self.running = True
+        self.dirty = True
+        self.last_draw = 0.0
+        self.last_clock = 0.0
+        self.last_health = 0.0
 
-        if WINDOWED:
-            self.root.geometry("1200x760")
+        if not self.headless:
+            self._init_ui()
+            self._health_check()
+        logging.info("xOS shell started; model=%s url=%s lang=%s", MODEL, OLLAMA_URL, self.language)
+
+    # ------------------------------------------------------------- lifecycle
+    def _init_ui(self) -> None:
+        curses.curs_set(0)
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        self.scr.keypad(True)
+        self.scr.nodelay(True)
+        self.scr.timeout(self.TICK_MS)
+        self._init_colors()
+
+    def _init_colors(self) -> None:
+        self.has256 = curses.COLORS >= 256
+        bg = -1
+        if self.has256:
+            mint, muted, warn, bad, accent = 121, 245, 221, 203, 87
         else:
-            self.root.attributes("-fullscreen", True)
+            mint, muted, warn, bad, accent = curses.COLOR_CYAN, curses.COLOR_WHITE, \
+                curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN
+        try:
+            curses.init_pair(1, mint, bg)     # mint / accent
+            curses.init_pair(2, muted, bg)    # muted text
+            curses.init_pair(3, warn, bg)     # warning
+            curses.init_pair(4, bad, bg)      # error
+            curses.init_pair(5, accent, bg)   # input / highlight
+        except curses.error:
+            pass
+        self.C_MINT = curses.color_pair(1)
+        self.C_MUTED = curses.color_pair(2)
+        self.C_WARN = curses.color_pair(3)
+        self.C_BAD = curses.color_pair(4)
+        self.C_INPUT = curses.color_pair(5)
+        self.A_BOLD = curses.A_BOLD
 
-        self.root.after(50, self._drain_events)
-        self.root.after(200, self._health_check)
-        self.root.after(250, self._assert_fullscreen)
-        self.root.after(20_000, self._periodic_health)
-        self.root.after(300, self.entry.focus_set)
-        logging.info(
-            "xOS shell started; model=%s url=%s language=%s",
-            MODEL,
-            OLLAMA_URL,
-            self.language,
-        )
-
-    # ------------------------------------------------------------- language
+    # -------------------------------------------------------------- language
     def tr(self, key: str, **values: Any) -> str:
-        """Translate a UI key, falling back to English."""
-        template = STRINGS.get(self.language, {}).get(key)
-        if template is None:
-            template = STRINGS["en"][key]
+        template = STRINGS.get(self.language, {}).get(key) or STRINGS["en"].get(key, key)
         return template.format(**values)
 
     def _system_prompt(self) -> str:
@@ -380,9 +371,7 @@ class XOSShell:
         )
 
     def _available_languages(self) -> str:
-        return ", ".join(
-            f"{code} ({name})" for code, name in SUPPORTED_LANGUAGES.items()
-        )
+        return ", ".join(f"{c} ({n})" for c, n in SUPPORTED_LANGUAGES.items())
 
     def _set_language(self, code: str) -> bool:
         if code not in SUPPORTED_LANGUAGES:
@@ -390,435 +379,40 @@ class XOSShell:
         self.language = code
         if self.history:
             self.history[0]["content"] = self._system_prompt()
-        self._refresh_language_ui()
+        self.dirty = True
         return True
 
-    def _refresh_language_ui(self) -> None:
-        self._set_busy(self.busy)
-        quit_hint = self.tr("quit_hint") if ALLOW_QUIT else ""
-        self.footer_hint_label.configure(text=self.tr("footer_hint") + quit_hint)
-        self.offline_badge.configure(text=self.tr("offline_badge"))
-        self.welcome_kicker_label.configure(text=self.tr("welcome_kicker"))
-        self.welcome_title_label.configure(text=self.tr("welcome_title"))
-        self.welcome_sub_label.configure(text=self.tr("welcome_sub"))
-        self._refresh_status()
-
-    def _refresh_status(self) -> None:
+    # ---------------------------------------------------------------- status
+    def _state(self) -> tuple[str, int]:
         if self.busy:
-            self._set_status(self.tr("generating"), self.ACCENT)
-        elif not self.health_checked:
-            self._set_status(self.tr("connecting"), self.AMBER)
-        elif not self.server_ok:
-            self._set_status(self.tr("offline"), self.RED)
-        elif not self.model_ok:
-            self._set_status(self.tr("model_missing"), self.AMBER)
-        else:
-            self._set_status(self.tr("ready_model", model=self.active_model), self.GREEN)
+            return self.tr("generating"), self.C_MINT
+        if not self.health_checked:
+            return self.tr("connecting"), self.C_WARN
+        if not self.server_ok:
+            return self.tr("offline"), self.C_BAD
+        if not self.model_ok:
+            return self.tr("model_missing"), self.C_WARN
+        return self.tr("ready"), self.C_MINT
 
-    # ------------------------------------------------------------------ UI
-    def _pick_fonts(self) -> tuple[str, str]:
-        families = set(tkfont.families(self.root))
-        for candidate in ("Inter", "IBM Plex Sans", "DejaVu Sans", "Liberation Sans"):
-            if candidate in families:
-                ui = candidate
-                break
-        else:
-            ui = "TkDefaultFont"
-
-        for candidate in ("IBM Plex Mono", "DejaVu Sans Mono", "Liberation Mono"):
-            if candidate in families:
-                mono = candidate
-                break
-        else:
-            mono = "TkFixedFont"
-        return ui, mono
-
-    def _ui_scale(self) -> float:
-        width = self.root.winfo_screenwidth()
-        height = self.root.winfo_screenheight()
-        return max(0.80, min(1.20, min(width / 1280.0, height / 800.0)))
-
-    def _build_ui(self) -> None:
-        screen_w = self.root.winfo_screenwidth()
-        side = max(28, int((screen_w - 1120) / 2))
-        vpad = self.fs(26)
-
-        shell = tk.Frame(self.root, bg=self.BG)
-        shell.pack(fill="both", expand=True, padx=side, pady=(vpad, self.fs(18)))
-
-        # Header ---------------------------------------------------------
-        header = tk.Frame(shell, bg=self.BG)
-        header.pack(fill="x")
-
-        brand = tk.Frame(header, bg=self.BG)
-        brand.pack(side="left")
-        tk.Label(
-            brand,
-            text="xOS",
-            bg=self.BG,
-            fg=self.FG,
-            font=(self.ui_font, self.fs(14), "bold"),
-        ).pack(side="left")
-
-
-        self.clock_label = tk.Label(
-            header,
-            text="",
-            bg=self.BG,
-            fg=self.MUTED,
-            font=(self.mono_font, self.fs(9)),
-        )
-        self.clock_label.pack(side="right", padx=(self.fs(14), 0))
-
-        def update_clock():
-            now = datetime.datetime.now().strftime("%H:%M:%S")
-            self.clock_label.configure(text=now)
-            self.root.after(1000, update_clock)
-        
-        self.root.after(0, update_clock)
-
-
-        self.model_chip = tk.Label(
-            header,
-            text=self.active_model,
-            bg=self.PANEL,
-            fg=self.MUTED,
-            font=(self.mono_font, self.fs(9)),
-            padx=self.fs(10),
-            pady=self.fs(4),
-            highlightbackground=self.BORDER,
-            highlightthickness=1,
-        )
-        self.model_chip.pack(side="right", padx=(self.fs(14), 0))
-
-        self.status_label = tk.Label(
-            header,
-            textvariable=self.status_var,
-            bg=self.BG,
-            fg=self.MUTED,
-            font=(self.ui_font, self.fs(9)),
-        )
-        self.status_label.pack(side="right")
-
-        self.dot = tk.Canvas(
-            header,
-            width=self.fs(10),
-            height=self.fs(10),
-            bg=self.BG,
-            highlightthickness=0,
-            bd=0,
-        )
-        self.dot_id = self.dot.create_oval(
-            2, 2, self.fs(8), self.fs(8), fill=self.AMBER, outline=""
-        )
-        self.dot.pack(side="right", padx=(0, self.fs(7)))
-
-        tk.Frame(shell, bg=self.BORDER, height=1).pack(fill="x", pady=(self.fs(16), 0))
-
-        # Conversation ---------------------------------------------------
-        body = tk.Frame(shell, bg=self.BG)
-        body.pack(fill="both", expand=True, pady=(self.fs(22), 0))
-
-        self.text = tk.Text(
-            body,
-            bg=self.BG,
-            fg=self.ASSISTANT,
-            insertbackground=self.ACCENT,
-            selectbackground=self.ACCENT_SOFT,
-            selectforeground=self.FG,
-            inactiveselectbackground=self.ACCENT_SOFT,
-            font=(self.ui_font, self.fs(12)),
-            wrap="word",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            padx=0,
-            pady=0,
-            cursor="arrow",
-            takefocus=0,
-        )
-        self.text.pack(fill="both", expand=True)
-
-        self.text.tag_configure(
-            "label_user",
-            foreground=self.ACCENT,
-            font=(self.ui_font, self.fs(9), "bold"),
-            spacing1=self.fs(18),
-            spacing3=self.fs(3),
-        )
-        self.text.tag_configure(
-            "user",
-            foreground=self.FG,
-            font=(self.ui_font, self.fs(13)),
-            spacing3=self.fs(8),
-            lmargin1=0,
-            lmargin2=0,
-        )
-        self.text.tag_configure(
-            "label_assistant",
-            foreground=self.MUTED,
-            font=(self.ui_font, self.fs(9), "bold"),
-            spacing1=self.fs(16),
-            spacing3=self.fs(3),
-        )
-        self.text.tag_configure(
-            "label_nalar",
-            foreground=self.MUTED,
-            font=(self.ui_font, self.fs(9), "bold"),
-            spacing1=self.fs(16),
-            spacing3=self.fs(3),
-        )
-        self.text.tag_configure(
-            "assistant",
-            foreground=self.ASSISTANT,
-            font=(self.ui_font, self.fs(12)),
-            spacing3=self.fs(14),
-            lmargin1=0,
-            lmargin2=0,
-        )
-        self.text.tag_configure(
-            "notice",
-            foreground=self.MUTED,
-            font=(self.mono_font, self.fs(10)),
-            spacing1=self.fs(8),
-            spacing3=self.fs(8),
-            lmargin1=0,
-            lmargin2=0,
-        )
-        self.text.tag_configure(
-            "error",
-            foreground=self.ERROR,
-            font=(self.ui_font, self.fs(11)),
-            spacing1=self.fs(6),
-            spacing3=self.fs(12),
-        )
-        self.text.configure(state="disabled")
-
-        self._bind_text_scroll()
-        self._build_welcome(body)
-
-        # Input ----------------------------------------------------------
-        input_outer = tk.Frame(shell, bg=self.BG)
-        input_outer.pack(fill="x", pady=(self.fs(18), 0))
-
-        self.input_box = tk.Frame(
-            input_outer,
-            bg=self.PANEL,
-            highlightbackground=self.BORDER,
-            highlightthickness=1,
-        )
-        self.input_box.pack(fill="x")
-
-        tk.Label(
-            self.input_box,
-            text="›",
-            bg=self.PANEL,
-            fg=self.ACCENT,
-            font=(self.ui_font, self.fs(18)),
-        ).pack(side="left", padx=(self.fs(15), self.fs(4)))
-
-        self.entry = tk.Entry(
-            self.input_box,
-            bg=self.PANEL,
-            fg=self.FG,
-            insertbackground=self.ACCENT,
-            insertwidth=2,
-            selectbackground=self.ACCENT_SOFT,
-            selectforeground=self.FG,
-            font=(self.ui_font, self.fs(13)),
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-        )
-        self.entry.pack(
-            side="left",
-            fill="x",
-            expand=True,
-            ipady=self.fs(13),
-            pady=self.fs(2),
-        )
-        self.entry.bind("<FocusIn>", lambda _e: self.input_box.configure(
-            highlightbackground=self.ACCENT
-        ))
-        self.entry.bind("<FocusOut>", lambda _e: self.input_box.configure(
-            highlightbackground=self.BORDER
-        ))
-
-        self.send_btn = tk.Button(
-            self.input_box,
-            text=self.tr("send"),
-            command=self._on_send_button,
-            bg=self.ACCENT,
-            fg=self.BUTTON_TEXT,
-            activebackground="#a5f3fc",
-            activeforeground=self.BUTTON_TEXT,
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            padx=self.fs(17),
-            pady=self.fs(8),
-            font=(self.ui_font, self.fs(9), "bold"),
-            cursor="hand2",
-            takefocus=0,
-        )
-        self.send_btn.pack(side="right", padx=self.fs(7), pady=self.fs(7))
-
-        footer = tk.Frame(shell, bg=self.BG)
-        footer.pack(fill="x", pady=(self.fs(9), 0))
-
-        quit_hint = self.tr("quit_hint") if ALLOW_QUIT else ""
-        self.footer_hint_label = tk.Label(
-            footer,
-            text=self.tr("footer_hint") + quit_hint,
-            bg=self.BG,
-            fg=self.MUTED,
-            font=(self.ui_font, self.fs(8)),
-        )
-        self.footer_hint_label.pack(side="left")
-
-        self.offline_badge = tk.Label(
-            footer,
-            text=self.tr("offline_badge"),
-            bg=self.BG,
-            fg=self.MUTED,
-            font=(self.mono_font, self.fs(8)),
-        )
-        self.offline_badge.pack(side="right")
-
-    def _build_welcome(self, parent: tk.Widget) -> None:
-        self.welcome = tk.Frame(parent, bg=self.BG)
-        self.welcome.place(relx=0.5, rely=0.43, anchor="center")
-        self.welcome.bind("<Button-1>", lambda _e: self.entry.focus_set())
-
-        self.welcome_kicker_label = tk.Label(
-            self.welcome,
-            text=self.tr("welcome_kicker"),
-            bg=self.BG,
-            fg=self.MUTED,
-            font=(self.mono_font, self.fs(8)),
-        )
-        self.welcome_kicker_label.pack(pady=(0, self.fs(13)))
-
-        self.welcome_title_label = tk.Label(
-            self.welcome,
-            text=self.tr("welcome_title"),
-            bg=self.BG,
-            fg=self.FG,
-            font=(self.ui_font, self.fs(27)),
-        )
-        self.welcome_title_label.pack()
-
-        self.welcome_sub_label = tk.Label(
-            self.welcome,
-            text=self.tr("welcome_sub"),
-            bg=self.BG,
-            fg=self.MUTED,
-            font=(self.ui_font, self.fs(10)),
-        )
-        self.welcome_sub_label.pack(pady=(self.fs(10), 0))
-
-    def _assert_fullscreen(self) -> None:
-        if WINDOWED:
-            return
-        try:
-            self.root.attributes("-fullscreen", True)
-            self.root.lift()
-            self.entry.focus_set()
-        except tk.TclError:
-            pass
-
-    def _bind_text_scroll(self) -> None:
-        def scroll(delta: int) -> str:
-            self.text.yview_scroll(delta, "units")
-            return "break"
-
-        self.text.bind("<Button-4>", lambda _e: scroll(-3))
-        self.text.bind("<Button-5>", lambda _e: scroll(3))
-        self.text.bind(
-            "<MouseWheel>",
-            lambda e: scroll(-3 if e.delta > 0 else 3),
-        )
-
-    def _bind_keys(self) -> None:
-        self.entry.bind("<Return>", self._on_enter)
-        self.entry.bind("<KP_Enter>", self._on_enter)
-        self.root.bind("<Control-l>", lambda _e: self._clear())
-        self.root.bind("<Control-L>", lambda _e: self._clear())
-        self.root.bind("<Escape>", self._on_escape)
-        if ALLOW_QUIT:
-            self.root.bind("<Control-Shift-Q>", lambda _e: self._close())
-            self.root.bind("<Control-Shift-q>", lambda _e: self._close())
-
-    # -------------------------------------------------------------- helpers
-    def _at_bottom(self) -> bool:
-        try:
-            return self.text.yview()[1] >= 0.995
-        except tk.TclError:
-            return True
-
-    def _append(self, text: str, tag: str, follow: bool | None = None) -> None:
-        if follow is None:
-            follow = self._at_bottom()
-        self.text.configure(state="normal")
-        self.text.insert("end", text, tag)
-        self.text.configure(state="disabled")
-        if follow:
-            self.text.see("end")
-
-    def _hide_welcome(self) -> None:
-        if self.welcome_visible:
-            self.welcome.place_forget()
-            self.welcome_visible = False
-
-    def _show_welcome(self) -> None:
-        if not self.welcome_visible:
-            self.welcome.place(relx=0.5, rely=0.43, anchor="center")
-            self.welcome_visible = True
-
-    def _set_status(self, text: str, color: str) -> None:
-        self.status_var.set(text)
-        self.dot.itemconfigure(self.dot_id, fill=color)
-
-    def _set_busy(self, busy: bool) -> None:
-        self.busy = busy
-        if busy:
-            self.send_btn.configure(
-                text=self.tr("stop"),
-                bg=self.RED,
-                activebackground="#fda4af",
-            )
-        else:
-            self.send_btn.configure(
-                text=self.tr("send"),
-                bg=self.ACCENT,
-                activebackground="#a5f3fc",
-            )
-
-    def _scroll_end(self) -> None:
-        self.text.see("end")
-
-    # --------------------------------------------------------------- health
-    def _periodic_health(self) -> None:
-        self._health_check()
-        self.root.after(20_000, self._periodic_health)
-
+    # ------------------------------------------------------------------- net
     def _health_check(self) -> None:
         if self.health_busy:
+            return
+        if STRICT_LOCAL and not is_loopback(OLLAMA_URL):
+            self.events.put(("error", "Security Error: Remote endpoint rejected in strict local mode.", 0))
+            self.health_checked = True
+            self.server_ok = False
             return
         self.health_busy = True
         threading.Thread(target=self._health_worker, daemon=True).start()
 
     def _health_worker(self) -> None:
         try:
-            with request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=4) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            names = {
-                str(item.get("name", ""))
-                for item in payload.get("models", [])
-                if isinstance(item, dict)
-            }
+            with request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=4) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            names = {str(i.get("name", "")) for i in payload.get("models", []) if isinstance(i, dict)}
             self.events.put(("health", (True, names, ""), 0))
-        except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+        except Exception as exc:  # noqa: BLE001
             self.events.put(("health", (False, set(), str(exc)), 0))
         finally:
             self.health_busy = False
@@ -827,21 +421,28 @@ class XOSShell:
         if self.active_model in names:
             return True
         if ":" not in self.active_model:
-            return any(name.startswith(self.active_model + ":") for name in names)
+            return any(n.startswith(self.active_model + ":") for n in names)
         return False
 
-    def _apply_health(self, ok: bool, names: set[str], detail: str) -> None:
-        self.health_checked = True
-        self.server_ok = ok
-        self.installed_model_names = names
-        self.model_ok = ok and self._model_present(names)
-        if self.busy:
-            return
-        if not ok:
-            logging.debug("Ollama health check failed: %s", detail)
-        self._refresh_status()
+    @staticmethod
+    def _decode_stream_line(line: str) -> list[dict[str, Any]]:
+        try:
+            decoder = json.JSONDecoder()
+            objects: list[dict[str, Any]] = []
+            pos = 0
+            while pos < len(line):
+                value, end = decoder.raw_decode(line, pos)
+                if not isinstance(value, dict):
+                    raise ValueError("stream chunk is not a JSON object")
+                objects.append(value)
+                pos = end
+                while pos < len(line) and line[pos].isspace():
+                    pos += 1
+            return objects
+        except Exception:
+            logging.error("Malformed NDJSON chunk: %s", line)
+            return []
 
-    # --------------------------------------------------------------- worker
     def _messages_for_api(self) -> list[dict[str, str]]:
         system = self.history[0]
         tail = self.history[1:]
@@ -857,28 +458,11 @@ class XOSShell:
                 break
         return [system] + list(reversed(selected))
 
-    @staticmethod
-    def _decode_stream_line(line: str) -> list[dict[str, Any]]:
-        """Decode one line, tolerating concatenated JSON objects.
+    def _chat_worker(self, messages: list[dict[str, str]], gen: int) -> None:
+        if STRICT_LOCAL and not is_loopback(OLLAMA_URL):
+            self.events.put(("failed", "Security Error: Remote endpoint rejected in strict local mode.", gen))
+            return
 
-        Ollama normally emits NDJSON (one object per line), but some proxies
-        batch objects without a newline. Parsing with raw_decode is cheap and
-        keeps a partial/misbehaving stream from killing the UI.
-        """
-        decoder = json.JSONDecoder()
-        objects: list[dict[str, Any]] = []
-        position = 0
-        while position < len(line):
-            value, end = decoder.raw_decode(line, position)
-            if not isinstance(value, dict):
-                raise ValueError("stream chunk bukan object JSON")
-            objects.append(value)
-            position = end
-            while position < len(line) and line[position].isspace():
-                position += 1
-        return objects
-
-    def _chat_worker(self, messages: list[dict[str, str]], generation: int) -> None:
         payload = {
             "model": self.active_model,
             "messages": messages,
@@ -890,19 +474,17 @@ class XOSShell:
                 "num_predict": NUM_PREDICT,
             },
         }
-        data = json.dumps(payload).encode("utf-8")
         req = request.Request(
             f"{OLLAMA_URL}/api/chat",
-            data=data,
+            data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-
         parts: list[str] = []
         response = None
         try:
             response = request.urlopen(req, timeout=600)
-            if generation != self.generation or self.stop_event.is_set():
+            if gen != self.generation or self.stop_event.is_set():
                 return
             self.response = response
             for raw_line in response:
@@ -917,16 +499,16 @@ class XOSShell:
                     content = (chunk.get("message") or {}).get("content") or ""
                     if content:
                         parts.append(content)
-                        self.events.put(("token", content, generation))
+                        self.events.put(("token", content, gen))
                     if chunk.get("done"):
-                        self.events.put(("finished", "".join(parts), generation))
+                        self.events.put(("done", "".join(parts), gen))
                         return
-            self.events.put(("finished", "".join(parts), generation))
-        except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+            self.events.put(("done", "".join(parts), gen))
+        except Exception as exc:  # noqa: BLE001
             if self.stop_event.is_set():
-                self.events.put(("finished", "".join(parts), generation))
+                self.events.put(("done", "".join(parts), gen))
             else:
-                self.events.put(("failed", self._format_error(exc), generation))
+                self.events.put(("failed", self._format_error(exc), gen))
         finally:
             if self.response is response:
                 self.response = None
@@ -937,7 +519,6 @@ class XOSShell:
                     pass
 
     def _abort_response(self) -> None:
-        """Close the active stream and wake a worker blocked on read()."""
         response = self.response
         if response is None:
             return
@@ -946,7 +527,7 @@ class XOSShell:
             sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
             if sock is not None:
                 sock.shutdown(socket.SHUT_RDWR)
-        except Exception:  # noqa: BLE001 - best effort cancellation
+        except Exception:  # noqa: BLE001
             pass
         try:
             response.close()
@@ -970,287 +551,432 @@ class XOSShell:
             return self.tr("error_timeout")
         return self.tr("error_generic", detail=exc)
 
-    # ---------------------------------------------------------------- events
-    def _drain_events(self) -> None:
+    # ------------------------------------------------------------- commands
+    def _fetch_models(self) -> list[dict[str, Any]]:
+        with request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=6) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("models", [])
+
+    def _models_worker(self) -> None:
         try:
-            while True:
-                kind, payload, generation = self.events.get_nowait()
-                if kind == "health":
-                    ok, names, detail = payload
-                    self._apply_health(ok, names, detail)
-                    continue
-                if kind == "notice":
-                    self._append(str(payload), "notice", follow=True)
-                    continue
-                if kind == "error":
-                    self._append(str(payload), "error", follow=True)
-                    continue
-                if kind == "model_switched":
-                    self._apply_model_switch(str(payload))
-                    continue
-                if kind == "model_deleted":
-                    self._apply_model_deleted(str(payload))
-                    continue
-                if kind == "model_pulled":
-                    self._apply_model_pulled(str(payload))
-                    continue
-                if generation != self.generation:
-                    continue
-                if kind == "token":
-                    self._append(payload, "assistant", follow=True)
-                elif kind == "finished":
-                    self._finish(payload)
-                elif kind == "failed":
-                    self._fail(payload)
-        except queue.Empty:
-            pass
-        except tk.TclError:
-            return
-        self.root.after(40, self._drain_events)
+            models = self._fetch_models()
+            lines = []
+            if not models:
+                lines.append(self.tr("models_empty"))
+            else:
+                lines.append(self.tr("models_title", count=len(models)))
+                for item in models:
+                    name = str(item.get("name", "unknown"))
+                    is_active = name == self.active_model or (
+                        ":" not in self.active_model and name.startswith(self.active_model + ":")
+                    )
+                    marker = "*" if is_active else " "
+                    suffix = " " + self.tr("model_active") if is_active else ""
+                    lines.append(f" {marker} {name}  ({format_size(item.get('size', 0))}){suffix}")
+                lines.append("")
+                lines.append(self.tr("models_hint"))
+            self.events.put(("notice", "\n".join(lines), 0))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("error", self._format_error(exc), 0))
+
+    def _switch_worker(self, target: str) -> None:
+        try:
+            names = [str(i.get("name", "")) for i in self._fetch_models()]
+            match = None
+            for n in names:
+                if n == target or (":" not in target and n.startswith(target + ":")):
+                    match = n
+                    break
+            if match:
+                self.events.put(("switched", match, 0))
+            else:
+                self.events.put(("error", self.tr(
+                    "model_not_found", model=target, available=", ".join(names) or "(none)"), 0))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("error", self._format_error(exc), 0))
+
+    def _delete_worker(self, target: str) -> None:
+        try:
+            names = [str(i.get("name", "")) for i in self._fetch_models()]
+            match = next((n for n in names if n == target or
+                          (":" not in target and n.startswith(target + ":"))), None)
+            if not match:
+                self.events.put(("error", self.tr(
+                    "model_not_found", model=target, available=", ".join(names) or "(none)"), 0))
+                return
+            req = request.Request(
+                f"{OLLAMA_URL}/api/delete",
+                data=json.dumps({"name": match, "model": match}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="DELETE",
+            )
+            with request.urlopen(req, timeout=20) as resp:
+                resp.read()
+            self.events.put(("deleted", match, 0))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("error", self.tr("model_delete_fail", model=target, detail=str(exc)), 0))
+
+    def _pull_worker(self, target: str) -> None:
+        try:
+            req = request.Request(
+                f"{OLLAMA_URL}/api/pull",
+                data=json.dumps({"name": target, "stream": True}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            last = -1
+            with request.urlopen(req, timeout=1800) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    chunk = json.loads(line)
+                    if "error" in chunk:
+                        raise RuntimeError(str(chunk["error"]))
+                    total, done = chunk.get("total", 0), chunk.get("completed", 0)
+                    status = chunk.get("status", "")
+                    if total > 0:
+                        pct = int(done / total * 100)
+                        if pct != last and pct % 20 == 0:
+                            last = pct
+                            self.events.put(("progress", f"{status}: {pct}%", 0))
+                    elif status and status not in ("downloading", "pulling"):
+                        self.events.put(("progress", status, 0))
+            self.events.put(("pulled", target, 0))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("error", self.tr("model_pull_fail", model=target, detail=str(exc)), 0))
+
+    # ---------------------------------------------------------------- events
+    def _push(self, role: str, text: str) -> None:
+        self.messages.append({"role": role, "text": text})
+        self.scroll = 0
+        self.dirty = True
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                kind, payload, gen = self.events.get_nowait()
+            except queue.Empty:
+                return
+
+            if kind == "health":
+                ok, names, detail = payload
+                self.health_checked = True
+                self.server_ok = ok
+                self.installed = names
+                self.model_ok = ok and self._model_present(names)
+                if not ok:
+                    logging.debug("health check failed: %s", detail)
+                self.dirty = True
+                continue
+            if kind == "notice":
+                self._push("system", str(payload))
+                continue
+            if kind == "error":
+                self._push("error", str(payload))
+                continue
+            if kind == "progress":
+                if self.messages and self.messages[-1]["role"] == "system":
+                    self.messages[-1]["text"] = str(payload)
+                else:
+                    self._push("system", str(payload))
+                self.dirty = True
+                continue
+            if kind == "switched":
+                self.active_model = str(payload)
+                self.model_ok = True
+                self._push("system", self.tr("model_switched", model=self.active_model))
+                self._health_check()
+                continue
+            if kind == "deleted":
+                self._push("system", self.tr("model_deleted", model=str(payload)))
+                self._health_check()
+                continue
+            if kind == "pulled":
+                self._push("system", self.tr("model_pull_done", model=str(payload)))
+                self._health_check()
+                continue
+
+            if gen != self.generation:
+                continue
+            if kind == "token":
+                if self.messages and self.messages[-1]["role"] == "assistant":
+                    self.messages[-1]["text"] += payload
+                else:
+                    self._push("assistant", payload)
+                self.scroll = 0
+                self.dirty = True
+            elif kind == "done":
+                self._finish(str(payload))
+            elif kind == "failed":
+                self._fail(str(payload))
 
     def _finish(self, full_text: str) -> None:
         stopped = self.stop_event.is_set()
         self.stop_event.clear()
-        self._set_busy(False)
+        self.busy = False
 
+        if self.messages and self.messages[-1]["role"] == "assistant":
+            self.messages[-1]["text"] = full_text or self.messages[-1]["text"]
         if full_text:
-            self._append("\n", "assistant", follow=True)
             self.history.append({"role": "assistant", "content": full_text})
         elif not stopped:
-            self._append(self.tr("no_response") + "\n", "error", follow=True)
+            self._push("error", self.tr("no_response"))
 
         if stopped:
-            self._append("\n" + self.tr("stopped_note") + "\n", "notice", follow=True)
-            self._set_status(self.tr("stopped"), self.MUTED)
+            self._push("system", self.tr("stopped_note"))
         elif full_text:
             self.server_ok = True
             self.health_checked = True
             self.model_ok = True
-            self._set_status(self.tr("ready_model", model=self.active_model), self.GREEN)
-        self.entry.focus_set()
+        self.dirty = True
 
     def _fail(self, message: str) -> None:
         self.stop_event.clear()
-        self._set_busy(False)
-        self._append(f"{message}\n", "error", follow=True)
-        self._set_status(self.tr("error_status"), self.RED)
-        self.entry.focus_set()
+        self.busy = False
+        if self.messages and self.messages[-1]["role"] == "assistant" and not self.messages[-1]["text"]:
+            self.messages.pop()
+        self._push("error", message)
+        self.dirty = True
 
-    # ---------------------------------------------------------------- models
-    def _apply_model_switch(self, new_model: str) -> None:
-        self.active_model = new_model
-        self.model_chip.configure(text=self.active_model)
-        self.model_ok = True
-        self._refresh_status()
-        self._append(self.tr("model_switched", model=self.active_model), "notice", follow=True)
+    # ------------------------------------------------------------------ draw
+    def _wrap(self, text: str, width: int) -> list[str]:
+        if width < 8:
+            width = 8
+        out: list[str] = []
+        for para in text.split("\n"):
+            if not para:
+                out.append("")
+                continue
+            line = ""
+            for word in para.split(" "):
+                while len(word) > width:
+                    if line:
+                        out.append(line)
+                        line = ""
+                    out.append(word[:width])
+                    word = word[width:]
+                if not line:
+                    line = word
+                elif len(line) + 1 + len(word) <= width:
+                    line += " " + word
+                else:
+                    out.append(line)
+                    line = word
+            out.append(line)
+        return out
 
-    def _apply_model_deleted(self, deleted_model: str) -> None:
-        self._append(self.tr("model_deleted", model=deleted_model), "notice", follow=True)
-        if self.active_model == deleted_model or (
-            ":" not in self.active_model and deleted_model.startswith(self.active_model + ":")
-        ):
-            remaining = [m for m in self.installed_model_names if m != deleted_model]
-            if remaining:
-                self._apply_model_switch(remaining[0])
+    def _lines(self, width: int) -> list[tuple[str, int, int]]:
+        """Return (text, color_attr, bold) tuples for the whole transcript."""
+        rows: list[tuple[str, int, int]] = []
+        if not self.messages:
+            rows.append(("", 0, 0))
+            for txt, attr in (
+                (self.tr("welcome_kicker"), self.C_MUTED),
+                ("", 0),
+                (self.tr("welcome_title"), self.C_INPUT),
+                (self.tr("welcome_sub"), self.C_MUTED),
+            ):
+                rows.append((txt, attr, 0))
+            return rows
+
+        for msg in self.messages:
+            role = msg["role"]
+            if role == "user":
+                label, color = self.tr("you"), self.C_MINT
+            elif role == "assistant":
+                label, color = self.tr("assistant"), self.C_MUTED
+            elif role == "error":
+                label, color = self.tr("error").upper(), self.C_BAD
             else:
-                self.model_ok = False
-                self._refresh_status()
-        self._health_check()
+                label, color = self.tr("system"), self.C_WARN
+            rows.append((label, color, 1))
+            text = msg["text"]
+            if role == "assistant" and self.busy and msg is self.messages[-1]:
+                text += "▌"
+            for line in self._wrap(text, width - 2):
+                rows.append(("  " + line, color if role in ("error", "system") else 0, 0))
+            rows.append(("", 0, 0))
+        return rows
 
-    def _apply_model_pulled(self, pulled_model: str) -> None:
-        self._append(self.tr("model_pull_done", model=pulled_model), "notice", follow=True)
-        self._health_check()
+    def _put(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        limit = w - x - (1 if y == h - 1 else 0)
+        if limit <= 0:
+            return
+        try:
+            self.scr.addstr(y, x, text[:limit], attr)
+        except curses.error:
+            pass
 
-    def _cmd_models_list(self) -> None:
-        def worker() -> None:
-            try:
-                with request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                models = payload.get("models", [])
-                lines = []
-                if not models:
-                    lines.append(self.tr("models_empty"))
-                else:
-                    lines.append(self.tr("models_title", count=len(models)))
-                    for item in models:
-                        name = str(item.get("name", "unknown"))
-                        size_bytes = item.get("size", 0)
-                        size_str = format_size(size_bytes)
-                        is_active = (name == self.active_model) or (
-                            ":" not in self.active_model and name.startswith(self.active_model + ":")
-                        )
-                        marker = "  * " if is_active else "    "
-                        active_suffix = " " + self.tr("model_active_badge") if is_active else ""
-                        lines.append(f"{marker}{name} ({size_str}){active_suffix}\n")
-                    lines.append("\n" + self.tr("models_hint"))
-                self.events.put(("notice", "".join(lines), 0))
-            except Exception as exc:  # noqa: BLE001
-                self.events.put(("error", self._format_error(exc) + "\n", 0))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _cmd_switch_model(self, target: str) -> None:
-        target = target.strip()
-        if not target:
-            self._append(self.tr("model_switch_usage"), "notice", follow=True)
+    def _draw(self) -> None:
+        h, w = self.scr.getmaxyx()
+        self.scr.erase()
+        if h < 12 or w < 50:
+            self._put(0, 0, "xOS needs at least 50x12", self.C_BAD)
+            self.scr.refresh()
             return
 
-        def worker() -> None:
-            try:
-                with request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                models = [str(item.get("name", "")) for item in payload.get("models", [])]
-                matched = None
-                for m in models:
-                    if m == target or (":" not in target and m.startswith(target + ":")):
-                        matched = m
-                        break
-                if matched:
-                    self.events.put(("model_switched", matched, 0))
-                else:
-                    avail = ", ".join(models) if models else "(none)"
-                    self.events.put(
-                        ("error", self.tr("model_not_found", model=target, available=avail), 0)
-                    )
-            except Exception as exc:  # noqa: BLE001
-                self.events.put(("error", self._format_error(exc) + "\n", 0))
+        side = self.SIDEBAR_W
+        chat_w = w - side - 1
+        body_h = h - 4
 
-        threading.Thread(target=worker, daemon=True).start()
+        # header
+        self._put(0, 0, " " * w, self.C_MINT | curses.A_REVERSE)
+        self._put(0, 1, f"{APP_NAME}", self.C_MINT | curses.A_BOLD | curses.A_REVERSE)
+        self._put(0, 4, f" {self.tr('brand')}", self.C_MINT | curses.A_REVERSE)
+        alpha = self.tr("alpha")
+        self._put(0, w - len(alpha) - 2, alpha, self.C_MINT | curses.A_REVERSE)
 
-    def _cmd_delete_model(self, target: str) -> None:
-        target = target.strip()
-        if not target:
-            self._append(self.tr("model_rm_usage"), "notice", follow=True)
+        # body / transcript
+        lines = self._lines(chat_w)
+        visible = max(1, body_h)
+        max_scroll = max(0, len(lines) - visible)
+        self.scroll = min(self.scroll, max_scroll)
+        start = max(0, len(lines) - visible - self.scroll)
+        for i, (text, color, bold) in enumerate(lines[start:start + visible]):
+            attr = color | (curses.A_BOLD if bold else 0)
+            self._put(1 + i, 1, text, attr)
+
+        # sidebar
+        sx = w - side
+        self._put(1, sx - 1, "│", self.C_MUTED)
+        
+        # status section
+        self._put(1, sx + 1, self.tr("lbl_state"), self.C_MUTED | curses.A_BOLD)
+        state, state_color = self._state()
+        indicator = " ..." if self.busy else ""
+        self._put(2, sx + 1, f"{state}{indicator}", state_color | curses.A_BOLD)
+        
+        # model section
+        self._put(3, sx + 1, self.tr("lbl_model"), self.C_MUTED | curses.A_BOLD)
+        self._put(4, sx + 1, self.active_model, self.C_MINT)
+        
+        # language section
+        self._put(5, sx + 1, self.tr("lbl_lang"), self.C_MUTED | curses.A_BOLD)
+        lang_info = f"{self.language_name} ({self.language})"
+        self._put(6, sx + 1, lang_info, self.C_MINT)
+        
+        # clock section
+        self._put(7, sx + 1, self.tr("lbl_time"), self.C_MUTED | curses.A_BOLD)
+        self._put(8, sx + 1, self.clock or "--:--:--", self.C_MINT)
+        
+        # keys section
+        self._put(9, sx + 1, self.tr("lbl_keys"), self.C_MUTED | curses.A_BOLD)
+        help_text = self.tr("help")
+        for i, line in enumerate(help_text.split("\n")):
+            if i < 8: # cap to avoid overflow
+                self._put(10 + i, sx + 1, line, self.C_MUTED)
+            row += 3
+
+        self._put(row, sx + 1, "─" * (side - 3), self.C_MUTED)
+        self._put(row + 1, sx + 1, self.tr("lbl_keys"), self.C_MINT | curses.A_BOLD)
+        keys = [
+            ("Enter", self.tr("key_send")),
+            ("Esc", self.tr("key_stop")),
+            ("^L", self.tr("key_clear")),
+            ("/help", self.tr("key_commands")),
+        ]
+        for i, (key, what) in enumerate(keys):
+            self._put(row + 2 + i, sx + 1, f"{key:<6}{what}"[: side - 3], self.C_MUTED)
+
+        # separator + input
+        self._put(h - 4, 0, "─" * w, self.C_MUTED)
+        prompt = self.tr("input_prompt")
+        self._put(h - 3, 0, prompt, self.C_MINT | curses.A_BOLD)
+        avail = w - len(prompt) - 1
+        shown = self.input[-avail:] if len(self.input) > avail else self.input
+        self._put(h - 3, len(prompt), shown, self.C_INPUT)
+
+        # hint line
+        self._put(h - 2, 0, self.tr("hint")[:w], self.C_MUTED)
+
+        # cursor position in the input
+        try:
+            curses.curs_set(1)
+            cx = min(w - 1, len(prompt) + len(shown))
+            self.scr.move(h - 3, cx)
+        except curses.error:
+            pass
+
+        self.scr.refresh()
+
+    # ----------------------------------------------------------------- input
+    def _key(self, key: int) -> None:
+        if key == curses.KEY_RESIZE:
+            self.dirty = True
             return
-
-        def worker() -> None:
-            try:
-                with request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                models = [str(item.get("name", "")) for item in payload.get("models", [])]
-                matched = None
-                for m in models:
-                    if m == target or (":" not in target and m.startswith(target + ":")):
-                        matched = m
-                        break
-                if not matched:
-                    avail = ", ".join(models) if models else "(none)"
-                    self.events.put(
-                        ("error", self.tr("model_not_found", model=target, available=avail), 0)
-                    )
-                    return
-
-                data = json.dumps({"name": matched, "model": matched}).encode("utf-8")
-                req = request.Request(
-                    f"{OLLAMA_URL}/api/delete",
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="DELETE",
-                )
-                with request.urlopen(req, timeout=15) as del_resp:
-                    _ = del_resp.read()
-
-                self.events.put(("model_deleted", matched, 0))
-            except Exception as exc:  # noqa: BLE001
-                self.events.put(
-                    ("error", self.tr("model_delete_fail", model=target, detail=str(exc)), 0)
-                )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _cmd_pull_model(self, target: str) -> None:
-        target = target.strip()
-        if not target:
-            self._append(self.tr("model_pull_usage"), "notice", follow=True)
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            self.input = self.input[:-1]
+            self.dirty = True
             return
-
-        self._append(self.tr("model_pull_start", model=target), "notice", follow=True)
-
-        def worker() -> None:
+        if key in (10, 13, curses.KEY_ENTER):
+            self._submit()
+            return
+        if key == 27:  # Esc
+            if self.busy:
+                self._stop()
+            elif self.input:
+                self.input = ""
+                self.dirty = True
+            return
+        if key == 12:  # Ctrl+L
+            self._clear()
+            return
+        if key == 3:  # Ctrl+C
+            if ALLOW_QUIT:
+                self.running = False
+            else:
+                self._stop()
+            return
+        if key == 21:  # Ctrl+U
+            self.input = ""
+            self.dirty = True
+            return
+        if key == curses.KEY_UP:
+            self.scroll += 1
+            self.dirty = True
+            return
+        if key == curses.KEY_DOWN:
+            self.scroll = max(0, self.scroll - 1)
+            self.dirty = True
+            return
+        if key == curses.KEY_PPAGE:
+            self.scroll += 10
+            self.dirty = True
+            return
+        if key == curses.KEY_NPAGE:
+            self.scroll = max(0, self.scroll - 10)
+            self.dirty = True
+            return
+        if 32 <= key <= 0x10FFFF and key < 0x110000:
             try:
-                data = json.dumps({"name": target, "stream": True}).encode("utf-8")
-                req = request.Request(
-                    f"{OLLAMA_URL}/api/pull",
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                last_percent = -1
-                with request.urlopen(req, timeout=1800) as resp:
-                    for raw in resp:
-                        line = raw.decode("utf-8", "replace").strip()
-                        if not line:
-                            continue
-                        chunk = json.loads(line)
-                        if "error" in chunk:
-                            raise RuntimeError(str(chunk["error"]))
-                        total = chunk.get("total", 0)
-                        completed = chunk.get("completed", 0)
-                        status = chunk.get("status", "")
-                        if total > 0:
-                            percent = int((completed / total) * 100)
-                            if percent != last_percent and percent % 20 == 0:
-                                last_percent = percent
-                                self.events.put(
-                                    ("notice", f"[{target}] {status}: {percent}%\n", 0)
-                                )
-                        elif status and status not in ("downloading", "pulling"):
-                            self.events.put(("notice", f"[{target}] {status}\n", 0))
+                self.input += chr(key)
+                self.dirty = True
+            except ValueError:
+                pass
 
-                self.events.put(("model_pulled", target, 0))
-            except Exception as exc:  # noqa: BLE001
-                self.events.put(
-                    ("error", self.tr("model_pull_fail", model=target, detail=str(exc)), 0)
-                )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    # ---------------------------------------------------------------- actions
-    def _on_enter(self, _event: tk.Event) -> str:
-        if not self.busy:
-            self._send()
-        return "break"
-
-    def _on_escape(self, _event: tk.Event) -> str:
-        if self.busy:
-            self._stop()
-        elif self.entry.get():
-            self.entry.delete(0, "end")
-        return "break"
-
-    def _on_send_button(self) -> None:
-        if self.busy:
-            self._stop()
-        else:
-            self._send()
-
-    def _send(self) -> None:
-        text = self.entry.get().strip()
+    def _submit(self) -> None:
+        text = self.input.strip()
         if not text:
             return
+        self.input = ""
+        self.dirty = True
         if text.startswith("/"):
-            self.entry.delete(0, "end")
             self._command(text)
             return
-
-        self.entry.delete(0, "end")
         if len(text) > 6000:
             text = text[:6000]
-        self._hide_welcome()
-
-        self._append(self.tr("label_you") + "\n", "label_user", follow=True)
-        self._append(f"{text}\n", "user", follow=True)
+        self._push("user", text)
         self.history.append({"role": "user", "content": text})
-
-        self._append(self.tr("label_assistant") + "\n", "label_assistant", follow=True)
+        self._push("assistant", "")
         self.generation += 1
-        generation = self.generation
         self.stop_event.clear()
-        self._set_busy(True)
-        self._set_status(self.tr("generating"), self.ACCENT)
+        self.busy = True
         threading.Thread(
             target=self._chat_worker,
-            args=(self._messages_for_api(), generation),
+            args=(self._messages_for_api(), self.generation),
             daemon=True,
         ).start()
 
@@ -1258,155 +984,141 @@ class XOSShell:
         if not self.busy:
             return
         self.stop_event.set()
-        # Invalidate the in-flight generation immediately. Ollama may still be
-        # loading the model and not have sent response headers yet, in which
-        # case there is no socket to close and waiting would freeze the UI.
         self.generation += 1
         self._abort_response()
-        self._set_busy(False)
-        self._append("\n" + self.tr("stopped_note") + "\n", "notice", follow=True)
-        self._set_status(self.tr("stopped"), self.MUTED)
-        self.entry.focus_set()
+        self.busy = False
+        self._push("system", self.tr("stopped_note"))
+        self.dirty = True
 
     def _clear(self) -> None:
         self.generation += 1
         self.stop_event.set()
         self._abort_response()
         self.stop_event.clear()
-        self._set_busy(False)
-
+        self.busy = False
+        self.messages = []
+        self.scroll = 0
         self.history = [{"role": "system", "content": self._system_prompt()}]
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.configure(state="disabled")
-        self._show_welcome()
-        self._refresh_status()
-        self.entry.focus_set()
+        self.dirty = True
 
     def _command(self, command: str) -> None:
         parts = command.split()
         name = parts[0].lower()
+
         if name in ("/clear", "/reset"):
             self._clear()
             return
+        if name in ("/quit", "/exit"):
+            if ALLOW_QUIT:
+                self.running = False
+            else:
+                self._push("system", "Quit is disabled in this build (XOS_ALLOW_QUIT=0).")
+            return
 
-        self._hide_welcome()
-        self._append(self.tr("label_system") + "\n", "label_assistant", follow=True)
         if name in ("/help", "/?"):
-            self._append(
-                self.tr("help", model=self.active_model),
-                "notice",
-                follow=True,
-            )
-        elif name == "/models":
-            self._cmd_models_list()
-        elif name == "/model":
+            self._push("system", self.tr("help"))
+            return
+        if name == "/models":
+            self._push("system", self.tr("connecting") + "...")
+            threading.Thread(target=self._models_worker, daemon=True).start()
+            return
+        if name == "/model":
             if len(parts) == 1:
-                self._append(
-                    self.tr(
-                        "model_info",
-                        model=self.active_model,
-                        url=OLLAMA_URL,
-                        language=SUPPORTED_LANGUAGES[self.language],
-                        code=self.language,
-                    ),
-                    "notice",
-                    follow=True,
-                )
-            else:
-                sub = parts[1].lower()
-                arg = parts[2] if len(parts) > 2 else ""
-                if sub in ("list", "ls"):
-                    self._cmd_models_list()
-                elif sub in ("switch", "use", "set"):
-                    self._cmd_switch_model(arg)
-                elif sub in ("rm", "delete", "del"):
-                    self._cmd_delete_model(arg)
-                elif sub in ("pull", "download", "get"):
-                    self._cmd_pull_model(arg)
+                self._push("system", self.tr(
+                    "model_info", model=self.active_model, url=OLLAMA_URL,
+                    language=SUPPORTED_LANGUAGES[self.language], code=self.language))
+                return
+            sub = parts[1].lower()
+            arg = parts[2] if len(parts) > 2 else ""
+            if sub in ("list", "ls"):
+                self._push("system", self.tr("connecting") + "...")
+                threading.Thread(target=self._models_worker, daemon=True).start()
+            elif sub in ("switch", "use", "set"):
+                if not arg:
+                    self._push("system", self.tr("usage_switch"))
                 else:
-                    self._append(
-                        self.tr("model_help"),
-                        "notice",
-                        follow=True,
-                    )
-        elif name in ("/language", "/lang"):
+                    threading.Thread(target=self._switch_worker, args=(arg,), daemon=True).start()
+            elif sub in ("rm", "delete", "del"):
+                if not arg:
+                    self._push("system", self.tr("usage_rm"))
+                else:
+                    threading.Thread(target=self._delete_worker, args=(arg,), daemon=True).start()
+            elif sub in ("pull", "download", "get"):
+                if not arg:
+                    self._push("system", self.tr("usage_pull"))
+                else:
+                    self._push("system", self.tr("model_pull_start", model=arg))
+                    threading.Thread(target=self._pull_worker, args=(arg,), daemon=True).start()
+            else:
+                self._push("system", self.tr("help"))
+            return
+        if name in ("/language", "/lang"):
             if len(parts) == 1:
-                self._append(
-                    self.tr(
-                        "language_current",
-                        language=SUPPORTED_LANGUAGES[self.language],
-                        code=self.language,
-                        available=self._available_languages(),
-                    ),
-                    "notice",
-                    follow=True,
-                )
+                self._push("system", self.tr(
+                    "language_current", language=SUPPORTED_LANGUAGES[self.language],
+                    code=self.language, available=self._available_languages()))
             else:
-                requested = parts[1]
-                code = normalize_language(requested)
-                if code is None or not self._set_language(code):
-                    self._append(
-                        self.tr(
-                            "language_invalid",
-                            code=requested,
-                            available=self._available_languages(),
-                        ),
-                        "error",
-                        follow=True,
-                    )
+                code = normalize_language(parts[1])
+                if code and self._set_language(code):
+                    self._push("system", self.tr(
+                        "language_changed", language=SUPPORTED_LANGUAGES[code], code=code))
                 else:
-                    self._append(
-                        self.tr(
-                            "language_changed",
-                            language=SUPPORTED_LANGUAGES[code],
-                            code=code,
-                        ),
-                        "notice",
-                        follow=True,
-                    )
-        else:
-            self._append(
-                self.tr("unknown_command", name=name),
-                "error",
-                follow=True,
-            )
-        self.entry.focus_set()
+                    self._push("system", self.tr(
+                        "language_invalid", code=parts[1], available=self._available_languages()))
+            return
 
-    def _close(self) -> None:
-        self.generation += 1
-        self.stop_event.set()
-        response = self.response
-        if response is not None:
+        self._push("system", self.tr("unknown_command", name=name))
+
+    # ------------------------------------------------------------------ loop
+    def run(self) -> None:
+        # Set minimum draw interval to prevent CPU spikes and flicker during streaming
+        self.MIN_DRAW_INTERVAL = 0.03  # 30ms (~33 FPS)
+
+        while self.running:
+            now = time.monotonic()
+            self._drain()
+
+            if now - self.last_clock >= 1.0:
+                self.clock = datetime.datetime.now().strftime("%H:%M:%S")
+                self.last_clock = now
+                self.dirty = True
+            if now - self.last_health >= 20.0:
+                self.last_health = now
+                self._health_check()
+
+            if (self.dirty or (now - self.last_draw) >= 1.0) and \
+               (now - self.last_draw >= self.MIN_DRAW_INTERVAL):
+                self._draw()
+                self.dirty = False
+                self.last_draw = now
+
             try:
-                response.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self.root.destroy()
+                key = self.scr.getch()
+            except curses.error:
+                key = -1
+            if key != -1:
+                self._key(key)
 
 
-NalarShell = XOSShell
-
-
-def main() -> int:
-    logging.basicConfig(
-        level=get_env("XOS_LOG_LEVEL", "NALAR_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    root = tk.Tk()
-    XOSShell(root)
-
-    def report_callback_exception(exc_type, exc_value, exc_tb) -> None:
-        logging.exception("Unhandled UI error", exc_info=(exc_type, exc_value, exc_tb))
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass
-
-    root.report_callback_exception = report_callback_exception
-    root.mainloop()
-    return 0
+def main(stdscr: "curses.window") -> None:
+    Shell(stdscr).run()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if "--selftest" in sys.argv:
+        # Headless render check: no TTY required.
+        shell = Shell.__new__(Shell)
+        shell.language = "en"
+        shell.busy = False
+        shell.C_MINT = shell.C_MUTED = shell.C_WARN = shell.C_BAD = shell.C_INPUT = 0
+        shell.messages = [
+            {"role": "user", "text": "Explain what makes this machine different from a cloud assistant."},
+            {"role": "assistant", "text": "It has no outbound route. The model runs on loopback, so every "
+                                          "prompt stays on this box. Reboot and the machine is clean again."},
+        ]
+        shell.busy = False
+        for line in shell._lines(72):
+            print(line[0])
+        raise SystemExit(0)
+    curses.wrapper(main)

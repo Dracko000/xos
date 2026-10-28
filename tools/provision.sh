@@ -6,7 +6,11 @@ export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C.UTF-8
 
 MODEL="${MODEL:?MODEL is required}"
-XOS_PASSWORD="${XOS_PASSWORD:-${NALAR_PASSWORD:-xos}}"
+XOS_PASSWORD="${XOS_PASSWORD:-${NALAR_PASSWORD}}"
+if [[ -z "$XOS_PASSWORD" ]]; then
+    echo "ERROR: XOS_PASSWORD is not set. Default password 'xos' is disabled for security." >&2
+    exit 1
+fi
 TZ_NAME="${TZ_NAME:-Asia/Jakarta}"
 KIOSK_USER="${KIOSK_USER:-xos}"
 KIOSK_UID="${KIOSK_UID:-1000}"
@@ -28,6 +32,19 @@ EOF
 log "apt-get update..."
 apt-get update
 
+# Older builds shipped an Xorg + Openbox + Tk kiosk. xOS is now a console
+# (curses) shell, so strip any display stack left in a reused build tree.
+log "Removing legacy Xorg/Openbox/Tk packages (if present)..."
+legacy_pkgs="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E \
+    '^(xserver-xorg|x11-|xinit|xauth|openbox|unclutter|python3-tk|tk8|dbus-x11)' || true)"
+if [[ -n "$legacy_pkgs" ]]; then
+    # shellcheck disable=SC2086
+    apt-get purge -y $legacy_pkgs || warn "some legacy packages could not be purged"
+    apt-get autoremove -y --purge || true
+fi
+rm -f "/home/${KIOSK_USER:-xos}/.xinitrc"
+rm -rf "/home/${KIOSK_USER:-xos}/.config/openbox"
+
 # Avoid blocking questions from packages pulled in by casper/ubiquity.
 debconf-set-selections <<'EOF'
 grub-pc grub-pc/install_devices_empty boolean true
@@ -37,18 +54,11 @@ console-setup console-setup/charmap47 select UTF-8
 locales locales/default_environment_locale select en_US.UTF-8
 EOF
 
-log "Installing system packages, Xorg, Openbox, Tk, and casper..."
+log "Installing system packages and casper..."
 apt-get install -y --no-install-recommends \
-    systemd-sysv dbus dbus-x11 \
+    systemd-sysv dbus \
     linux-image-generic initramfs-tools casper \
-    xserver-xorg-core \
-    xserver-xorg-input-libinput \
-    xserver-xorg-video-vesa \
-    xserver-xorg-video-fbdev \
-    xserver-xorg-video-vmware \
-    xinit xauth x11-xserver-utils x11-utils \
-    openbox unclutter \
-    python3 python3-tk \
+    python3 \
     fonts-dejavu-core \
     locales tzdata console-setup keyboard-configuration \
     sudo curl ca-certificates \
@@ -89,7 +99,12 @@ if ! id -u "$KIOSK_USER" >/dev/null 2>&1; then
         --comment "xOS Kiosk" "$KIOSK_USER"
 fi
 
-for group in sudo video audio input render; do
+# Remove kiosk user from sudo group to ensure least privilege.
+# Administrative tasks should be handled via a separate recovery mechanism
+# or by a privileged user defined during build.
+gpasswd -d "$KIOSK_USER" sudo || true
+
+for group in video audio input render; do
     getent group "$group" >/dev/null 2>&1 || groupadd --system "$group"
     usermod -aG "$group" "$KIOSK_USER"
 done
@@ -104,8 +119,14 @@ install -m 0755 /tmp/xos-config/xos_shell.py /opt/xos-shell/xos_shell.py
 install -m 0644 /tmp/xos-config/system-prompt.txt /etc/xos/system-prompt.txt
 install -m 0644 /tmp/xos-config/xos-shell.env /etc/xos/xos-shell.env
 sed -i "s|^XOS_MODEL=.*|XOS_MODEL=$MODEL|" /etc/xos/xos-shell.env
+# No plaintext administrative password is shipped by default: xos-seal.sh
+# installs an unguessable random password at boot, so console login is
+# impossible. Set XOS_DEBUG_CONSOLE=1 at build time to keep XOS_PASSWORD on the
+# image (0600) for debugging; that weakens the image and is opt-in only.
 install -m 0600 /dev/null /etc/xos/alpha-password
-printf '%s' "$XOS_PASSWORD" >/etc/xos/alpha-password
+if [[ "${XOS_DEBUG_CONSOLE:-0}" == "1" ]]; then
+    printf '%s\n' "$XOS_PASSWORD" >/etc/xos/alpha-password
+fi
 
 cat >/usr/local/bin/xos-shell <<'EOF'
 #!/bin/sh
@@ -114,11 +135,17 @@ EOF
 chmod 0755 /usr/local/bin/xos-shell
 ln -sf /usr/local/bin/xos-shell /usr/local/bin/nalar-shell
 
-install -m 0755 /tmp/xos-config/xinitrc "/home/$KIOSK_USER/.xinitrc"
-chown "$KIOSK_USER:$KIOSK_USER" "/home/$KIOSK_USER/.xinitrc"
+# The shell renders directly on the Linux console (curses); no display server
+# is installed. Make sure the console font has the box-drawing glyphs used by
+# the TUI and that UTF-8 is active before the service starts.
+cat >/etc/default/console-setup <<'EOF'
+ACTIVE_CONSOLES="/dev/tty[1-6]"
+CHARMAP="UTF-8"
+CODESET="Lat15"
+FONTFACE="Terminus"
+FONTSIZE="16"
+EOF
 
-install -d -m 0755 -o "$KIOSK_USER" -g "$KIOSK_USER" \
-    "/home/$KIOSK_USER/.config/openbox"
 chown -R "$KIOSK_USER:$KIOSK_USER" "/home/$KIOSK_USER"
 
 # ------------------------------------------------------------------ services
@@ -149,6 +176,25 @@ rm -f /etc/systemd/system/getty.target.wants/getty@tty1.service
 
 # ------------------------------------------------------------------ ollama
 log "Installing Ollama..."
+
+verify_checksum() {
+    local file="$1"
+    local expected="$2"
+    local context="$3"
+    
+    if [[ -z "$expected" ]]; then
+        warn "No checksum provided for $context. Skipping integrity check."
+        return 0
+    fi
+    
+    local actual
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    if [[ "$actual" != "$expected" ]]; then
+        die "INTEGRITY FAILURE: Checksum for $context does not match!\\nExpected: $expected\\nActual: $actual"
+    fi
+    log "Integrity verified for $context."
+}
+
 if ! id -u ollama >/dev/null 2>&1; then
     useradd --system --create-home --home-dir /var/lib/ollama \
         --shell /usr/sbin/nologin ollama
@@ -157,19 +203,25 @@ install -d -m 0750 -o ollama -g ollama /var/lib/ollama
 
 # Upstream switched the Linux release asset from .tgz to .tar.zst in 2026.
 # Keep a fallback so older mirrors and pinned versions still work.
-ollama_archive=/tmp/ollama-linux-amd64.tar.zst
-if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
-    https://ollama.com/download/ollama-linux-amd64.tar.zst \
-    -o "$ollama_archive"; then
-    warn "archive .tar.zst failed to download, trying old .tgz..."
-    ollama_archive=/tmp/ollama-linux-amd64.tgz
-    curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
-        https://ollama.com/download/ollama-linux-amd64.tgz \
-        -o "$ollama_archive"
+OLLAMA_EXPECTED_SHA256="${OLLAMA_SHA256:-}"
+if [[ -x /usr/local/bin/ollama ]] && /usr/local/bin/ollama --version >/dev/null 2>&1; then
+    log "Ollama already installed, skipping download."
+else
+    ollama_archive=/tmp/ollama-linux-amd64.tar.zst
+    if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+        https://ollama.com/download/ollama-linux-amd64.tar.zst \
+        -o "$ollama_archive"; then
+        warn "archive .tar.zst failed to download, trying old .tgz..."
+        ollama_archive=/tmp/ollama-linux-amd64.tgz
+        curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+            https://ollama.com/download/ollama-linux-amd64.tgz \
+            -o "$ollama_archive"
+    fi
+    verify_checksum "$ollama_archive" "$OLLAMA_EXPECTED_SHA256" "Ollama binary archive"
+    tar --zstd -xf "$ollama_archive" -C /usr/local 2>/dev/null || \
+        tar -xzf "$ollama_archive" -C /usr/local
+    rm -f "$ollama_archive"
 fi
-tar --zstd -xf "$ollama_archive" -C /usr/local 2>/dev/null || \
-    tar -xzf "$ollama_archive" -C /usr/local
-rm -f "$ollama_archive"
 [[ -x /usr/local/bin/ollama ]] || { echo "Ollama binary not found" >&2; exit 1; }
 /usr/local/bin/ollama --version
 
@@ -273,8 +325,9 @@ ln -snf /etc/machine-id /var/lib/dbus/machine-id
 
 log "Quick verification..."
 python3 -m py_compile /opt/xos-shell/xos_shell.py
-python3 -c 'import tkinter' >/dev/null
+python3 -c 'import curses, json, urllib.request' >/dev/null
 test -x /usr/local/bin/xos-shell
 test -x /usr/local/bin/ollama
-test -f "/home/$KIOSK_USER/.xinitrc"
+test -f /etc/xos/xos-shell.env
+! command -v Xorg >/dev/null 2>&1 || { echo "Xorg should not be installed" >&2; exit 1; }
 log "Chroot provisioning complete."
